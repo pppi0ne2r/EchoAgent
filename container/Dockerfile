@@ -1,4 +1,4 @@
-FROM --platform=linux/arm64 kalilinux/kali-rolling:latest
+FROM --platform=amd64 kalilinux/kali-rolling:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV WGET_RETRY_FLAGS="--no-verbose --tries=5 --timeout=30 --waitretry=5 --retry-connrefused"
