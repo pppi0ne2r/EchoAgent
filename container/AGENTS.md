@@ -30,3 +30,8 @@ chisel 二进制程序在 /usr/share/chisel-common-binaries 下面
     * ...
 * 需要持续运行，或者共享给之后阶段的交互式命令，可以在 **tmux** 会话中运行，最后输出结论和总结的时候要说清楚 tmux 会话信息
     * 比如持续运行的用于接收数据的 HTTP服务，nc 接听反弹的Shell 等
+
+# 逆向分析
+* 容器启动时会在后台运行 pyghidra-mcp。Codex 已配置 MCP：`http://127.0.0.1:8000/mcp`
+* 分析二进制、固件或附件时优先使用已连接的 pyghidra-mcp 工具，不要再另起一份 Ghidra
+* Ghidra 工程目录是 /home/kali/ghidra-projects
