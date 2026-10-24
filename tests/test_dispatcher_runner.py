@@ -194,3 +194,89 @@ class DispatcherRunnerBudgetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _GateDispatcher:
+    seen: list[int] = []
+    slots: list[int | None] = []
+    ready = threading.Event()
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.stop_event = kwargs.get("stop_event") or threading.Event()
+        type(self).slots.append(kwargs.get("max_codex_slots"))
+
+    def run_once(self, project_id: int, release_project: bool = False) -> DispatchResult:
+        type(self).seen.append(project_id)
+        type(self).ready.set()
+        while not self.stop_event.is_set():
+            self.stop_event.wait(0.05)
+        return DispatchResult(project_id, DispatchMode.SKIPPED, ProjectStatus.ACTIVE, "stopped")
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+
+    def _release_project_if_running(self, project_id: int) -> None:
+        return None
+
+
+class DispatcherRunnerQueueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _GateDispatcher.seen = []
+        _GateDispatcher.slots = []
+        _GateDispatcher.ready = threading.Event()
+
+    def test_projects_beyond_the_limit_stay_queued_without_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            for project_id in (1, 2, 3):
+                store.create_project(project_id=project_id, target_url=f"http://target-{project_id}", objective="get flag")
+            runner = DispatcherRunner(store, runtime=ForceStopRuntime())
+            with (
+                patch.object(DispatcherRunner, "_concurrency_limit", return_value=1),
+                patch("echo_agent.server.dispatcher_runner.Dispatcher", _GateDispatcher),
+            ):
+                states = runner.start_many([1, 2, 3], interval_seconds=0.01)
+                self.assertTrue(_GateDispatcher.ready.wait(2))
+                self.assertEqual(_GateDispatcher.seen, [1])
+                self.assertTrue(states[0].running)
+                self.assertFalse(states[0].queued)
+                self.assertTrue(states[1].queued)
+                self.assertTrue(states[2].queued)
+                self.assertEqual(store.get_project(1).status, ProjectStatus.ACTIVE)
+                self.assertEqual(store.get_project(2).status, ProjectStatus.INACTIVE)
+                self.assertEqual(store.get_project(3).status, ProjectStatus.INACTIVE)
+                self.assertEqual(len(set(_GateDispatcher.slots)), 1)
+
+                removed = runner.stop(2)
+                self.assertFalse(removed.queued)
+                self.assertEqual(store.get_project(2).status, ProjectStatus.INACTIVE)
+
+                _GateDispatcher.ready.clear()
+                runner.stop(1)
+                self.assertTrue(_GateDispatcher.ready.wait(2))
+                self.assertEqual(_GateDispatcher.seen, [1, 3])
+                self.assertEqual(store.get_project(3).status, ProjectStatus.ACTIVE)
+                self.assertTrue(runner.status(3).running)
+                runner.stop_all()
+
+    def test_each_running_project_keeps_its_own_codex_slot_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            for project_id in (1, 2):
+                store.create_project(project_id=project_id, target_url=f"http://target-{project_id}", objective="get flag")
+            runner = DispatcherRunner(store, runtime=ForceStopRuntime())
+            with (
+                patch.object(DispatcherRunner, "_concurrency_limit", return_value=2),
+                patch("echo_agent.server.dispatcher_runner.Dispatcher", _GateDispatcher),
+            ):
+                runner.start_many([1, 2], interval_seconds=0.01)
+                deadline = threading.Event()
+                for _ in range(40):
+                    if len(_GateDispatcher.seen) == 2:
+                        deadline.set()
+                        break
+                    threading.Event().wait(0.05)
+                self.assertTrue(deadline.is_set())
+                self.assertEqual(_GateDispatcher.slots, [_GateDispatcher.slots[0], _GateDispatcher.slots[0]])
+                self.assertGreaterEqual(_GateDispatcher.slots[0] or 0, 1)
+                runner.stop_all()

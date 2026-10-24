@@ -226,6 +226,7 @@ class Dispatcher:
         self._log(project.id, "first-run initial intent started", "info", {"intent_id": intent.id})
         result = self._run_intent_with_slot(project, intent, DispatchMode.FIRST_RUN, scope="first-run")
         item = IntentExecutionResult(intent=intent, result=result)
+        before_facts = set(project.facts)
         try:
             self._commit_intent_result(project, item, release_project=release_project)
         except Exception as exc:
@@ -240,7 +241,11 @@ class Dispatcher:
             project.id,
             "first-run finished",
             "info" if not result.retryable else "warning",
-            {"intent_id": intent.id, "retryable": result.retryable},
+            {
+                "intent_id": intent.id,
+                "retryable": result.retryable,
+                "fact_ids": self._new_fact_ids(project, before_facts),
+            },
         )
         self._observe_target(item.result)
         offline = self._target_offline_result(project)
@@ -266,6 +271,7 @@ class Dispatcher:
         released_count = 0
         finished_items: list[IntentExecutionResult] = []
         for item in self._execute_intents(project, intents):
+            before_facts = set(project.facts)
             try:
                 self._commit_intent_result(project, item)
             except Exception as exc:
@@ -295,6 +301,7 @@ class Dispatcher:
                     "has_fact": bool(item.result.fact_description),
                     "has_answer": bool(item.result.answer),
                     "retryable": item.result.retryable,
+                    "fact_ids": self._new_fact_ids(project, before_facts),
                 },
             )
             finished_items.append(item)
@@ -382,7 +389,12 @@ class Dispatcher:
                 self._complete_project(project)
                 self._no_progress_reasons = 0
                 self._persist_step(project, release_project=release_project)
-                self._log(project.id, "reason marked project completed", "success", {"has_answer": True})
+                self._log(
+                    project.id,
+                    "reason marked project completed",
+                    "success",
+                    {"has_answer": True, "answer": result.answer},
+                )
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
             self._log(
                 project.id,
@@ -411,6 +423,7 @@ class Dispatcher:
                 }
             ]
         planned_count = 0
+        planned_intent_ids: list[int] = []
         skipped_repeat = 0
         skipped_from = 0
         for item in planned_intents:
@@ -437,12 +450,13 @@ class Dispatcher:
             if self._is_duplicate_intent(project, description, from_fact_id, action_key):
                 skipped_repeat += 1
                 continue
-            project.add_intent(
+            intent = project.add_intent(
                 description=description,
                 from_fact_id=from_fact_id,
                 to_fact_id=to_fact_id,
                 action_key=action_key,
             )
+            planned_intent_ids.append(intent.id)
             planned_count += 1
         if planned_count == 0 and result.salvaged:
             self._reason_salvage_failures += 1
@@ -477,7 +491,11 @@ class Dispatcher:
             project.id,
             f"reason planned {planned_count} new intents",
             "info",
-            {"skipped_repeat": skipped_repeat, "skipped_unplannable_from": skipped_from},
+            {
+                "intent_ids": planned_intent_ids,
+                "skipped_repeat": skipped_repeat,
+                "skipped_unplannable_from": skipped_from,
+            },
         )
         if planned_count == 0 and self._no_progress_reasons >= self.max_retryable_attempts:
             message = "reason made no progress"
@@ -601,7 +619,7 @@ class Dispatcher:
         producers = [
             intent
             for intent in project.intents.values()
-            if intent.to_fact_id == fact_id and intent.from_fact_id is not None
+            if fact_id in intent.to_fact_ids and intent.from_fact_id is not None
         ]
         if producers:
             latest = max(producers, key=lambda item: item.id)
@@ -856,6 +874,17 @@ class Dispatcher:
 
     @staticmethod
     def _apply_intent_result(project: Project, item: IntentExecutionResult) -> None:
+        intent = item.intent
+        before_facts = set(project.facts)
+        try:
+            Dispatcher._apply_intent_result_body(project, item)
+        finally:
+            produced = [fact_id for fact_id in project.facts if fact_id not in before_facts]
+            if produced:
+                intent.set_targets(produced)
+
+    @staticmethod
+    def _apply_intent_result_body(project: Project, item: IntentExecutionResult) -> None:
         result = item.result
         intent = item.intent
         Dispatcher._backfill_answer_source(project, result)
@@ -864,7 +893,7 @@ class Dispatcher:
                 intent.release()
             return
         if result.timed_out:
-            Dispatcher._store_worker_observations(project, result)
+            Dispatcher._store_worker_observations(project, result, intent.from_fact_id)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(
                     IntentOutcome.ERROR,
@@ -872,9 +901,9 @@ class Dispatcher:
                 )
             return
         for prior in result.prior_results:
-            Dispatcher._add_prior_fact(project, prior)
+            Dispatcher._add_prior_fact(project, prior, intent.from_fact_id)
         if result.outcome == "error":
-            Dispatcher._persist_json_facts_from_detail(project, result.detail)
+            Dispatcher._persist_json_facts_from_detail(project, result.detail, intent.from_fact_id)
             Dispatcher._record_partial_output(project, result.detail)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
@@ -898,7 +927,11 @@ class Dispatcher:
 
 
     @staticmethod
-    def _store_worker_observations(project: Project, result: WorkerResult) -> int:
+    def _store_worker_observations(
+        project: Project,
+        result: WorkerResult,
+        from_fact_id: int | None = None,
+    ) -> int:
         observations = list(result.prior_results)
         if result.fact_description or result.answer:
             observations.append(
@@ -911,11 +944,16 @@ class Dispatcher:
             )
         before = len(project.facts)
         for observation in observations:
-            Dispatcher._add_prior_fact(project, observation)
+            Dispatcher._add_prior_fact(project, observation, from_fact_id)
         return len(project.facts) - before
 
     @classmethod
-    def _persist_json_facts_from_detail(cls, project: Project, detail: str | None) -> int:
+    def _persist_json_facts_from_detail(
+        cls,
+        project: Project,
+        detail: str | None,
+        from_fact_id: int | None = None,
+    ) -> int:
         if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
             return 0
         tail = detail.split(cls._OUTPUT_TAIL_MARKER, 1)[1]
@@ -923,7 +961,7 @@ class Dispatcher:
             parsed = parse_worker_result(tail)
         except ValueError:
             return 0
-        return cls._store_worker_observations(project, parsed)
+        return cls._store_worker_observations(project, parsed, from_fact_id)
 
     @staticmethod
     def _reason_result_from_repair(exc: ReasonFormatError) -> ReasonResult | None:
@@ -936,7 +974,11 @@ class Dispatcher:
             return None
 
     @staticmethod
-    def _add_prior_fact(project: Project, observation: WorkerObservation) -> None:
+    def _add_prior_fact(
+        project: Project,
+        observation: WorkerObservation,
+        from_fact_id: int | None = None,
+    ) -> object | None:
         fact_text = _optional_fact_description(observation.fact_description)
         if not fact_text and observation.answer:
             fact_text = f"agent reported possible final answer: {observation.answer}"
@@ -945,11 +987,12 @@ class Dispatcher:
         if observation.answer_source:
             fact_text = f"{fact_text}\nsource: {observation.answer_source}"
         if observation.outcome == "refuted":
-            project.add_fact(fact_text, kind=FactKind.REFUTED)
+            fact = project.add_fact(fact_text, kind=FactKind.REFUTED)
+        elif observation.outcome == "error":
             return
-        if observation.outcome == "error":
-            return
-        project.add_fact(fact_text, kind=FactKind.EVIDENCE)
+        else:
+            fact = project.add_fact(fact_text, kind=FactKind.EVIDENCE)
+        return fact
 
     def _execute_intent(self, project: Project, intent: Intent, mode: DispatchMode) -> WorkerResult:
         with self._state_lock:
@@ -1115,15 +1158,21 @@ class Dispatcher:
             return same_text
         return same_text or action_keys_equivalent(action_key, intent.action_key)
 
+    _INITIAL_PROBE_DESCRIPTION = "初始探测目标并提取可继续分析的关键事实"
+
+    @staticmethod
+    def _is_initial_probe_intent(intent: Intent) -> bool:
+        return intent.description == Dispatcher._INITIAL_PROBE_DESCRIPTION
+
     @staticmethod
     def _create_initial_intent(project: Project) -> Intent:
         if 0 in project.facts and 1 in project.facts:
             return project.add_intent(
-                description="初始探测目标并提取可继续分析的关键事实",
+                description=Dispatcher._INITIAL_PROBE_DESCRIPTION,
                 from_fact_id=0,
                 to_fact_id=1,
             )
-        return project.add_intent(description="初始探测目标并提取可继续分析的关键事实")
+        return project.add_intent(description=Dispatcher._INITIAL_PROBE_DESCRIPTION)
 
     @staticmethod
     def _complete_intent_with_fact(project: Project, intent: Intent, fact_id: int) -> None:
@@ -1165,14 +1214,21 @@ class Dispatcher:
         )
         if source_fact is None:
             return
-        already_connected = any(
-            intent.from_fact_id == source_fact.id and intent.to_fact_id == 1
+        producers = [
+            intent
             for intent in project.intents.values()
-        )
-        if already_connected:
+            if source_fact.id in intent.to_fact_ids and not Dispatcher._is_initial_probe_intent(intent)
+        ]
+        if producers:
+            max(producers, key=lambda item: item.id).add_target(1)
+            return
+        if any(
+            intent.from_fact_id == source_fact.id and 1 in intent.to_fact_ids
+            for intent in project.intents.values()
+        ):
             return
         intent = project.add_intent(
-            description="确认该事实包含最终答案",
+            description="得到最终结果",
             from_fact_id=source_fact.id,
             to_fact_id=1,
         )
@@ -1259,6 +1315,10 @@ class Dispatcher:
             self._release_project(project)
             self.client.save_project(project)
             self._log(project.id, "project released to stoped", "info")
+
+    @staticmethod
+    def _new_fact_ids(project: Project, before: set[int]) -> list[int]:
+        return [fact_id for fact_id in project.facts if fact_id not in before]
 
     def _log(
         self,

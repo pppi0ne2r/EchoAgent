@@ -208,18 +208,58 @@ class Intent:
     outcome: IntentOutcome = IntentOutcome.PENDING
     note: str = ""
     action_key: str = ""
+    to_fact_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.id < 0:
             raise ValueError("intent id must be non-negative")
         if self.from_fact_id is not None and self.from_fact_id < 0:
             raise ValueError("intent from_fact_id must be non-negative")
-        if self.to_fact_id is not None and self.to_fact_id < 0:
-            raise ValueError("intent to_fact_id must be non-negative")
+        self.to_fact_ids = self._normalize_target_ids(self.to_fact_ids, self.to_fact_id)
+        if self.to_fact_id is None and self.to_fact_ids:
+            self.to_fact_id = self.to_fact_ids[-1]
         self.status = IntentStatus.coerce(self.status)
         self.outcome = IntentOutcome.coerce(self.outcome)
         self.note = str(self.note or "")
         self.action_key = normalize_action_key(self.action_key)
+
+    @staticmethod
+    def _normalize_target_ids(values: Iterable[int] | None, primary: int | None) -> tuple[int, ...]:
+        raw_values = list(values or ())
+        if primary is not None:
+            raw_values.append(primary)
+        ids: list[int] = []
+        for value in raw_values:
+            if value is None:
+                continue
+            fact_id = int(value)
+            if fact_id < 0:
+                raise ValueError("intent to_fact_id must be non-negative")
+            if fact_id not in ids:
+                ids.append(fact_id)
+        return tuple(ids)
+
+    def set_targets(self, fact_ids: Iterable[int], primary: int | None = None) -> None:
+        ids = self._normalize_target_ids(fact_ids, None)
+        if not ids:
+            return
+        if primary is not None:
+            primary = int(primary)
+            if primary < 0:
+                raise ValueError("intent to_fact_id must be non-negative")
+            if primary not in ids:
+                ids = (*ids, primary)
+        self.to_fact_ids = ids
+        self.to_fact_id = ids[-1] if primary is None else primary
+
+    def add_target(self, fact_id: int) -> None:
+        fact_id = int(fact_id)
+        if fact_id < 0:
+            raise ValueError("intent to_fact_id must be non-negative")
+        if fact_id not in self.to_fact_ids:
+            self.to_fact_ids = (*self.to_fact_ids, fact_id)
+        if self.to_fact_id is None:
+            self.to_fact_id = fact_id
 
     @property
     def is_executable(self) -> bool:
@@ -248,11 +288,12 @@ class Intent:
         self,
         to_fact_id: int | None = None,
         outcome: IntentOutcome | str = IntentOutcome.VERIFIED,
+        to_fact_ids: Iterable[int] | None = None,
     ) -> None:
-        if to_fact_id is not None:
-            if to_fact_id < 0:
-                raise ValueError("intent to_fact_id must be non-negative")
-            self.to_fact_id = to_fact_id
+        if to_fact_ids is not None:
+            self.set_targets(to_fact_ids, primary=to_fact_id)
+        elif to_fact_id is not None:
+            self.set_targets([to_fact_id])
         self.outcome = IntentOutcome.coerce(outcome)
         self.transition_to(IntentStatus.COMPLETED)
 
@@ -267,6 +308,7 @@ class Intent:
             "id": self.id,
             "from": self.from_fact_id,
             "to": self.to_fact_id,
+            "tos": list(self.to_fact_ids),
             "description": self.description,
             "status": self.status.value,
             "outcome": self.outcome.value,
@@ -276,15 +318,22 @@ class Intent:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Intent":
+        primary = data.get("to")
+        raw_targets = data.get("tos")
+        if raw_targets is None:
+            targets = () if primary is None else (int(primary),)
+        else:
+            targets = tuple(int(item) for item in raw_targets)
         return cls(
             id=int(data["id"]),
             from_fact_id=data.get("from"),
-            to_fact_id=data.get("to"),
+            to_fact_id=None if primary is None else int(primary),
             description=str(data.get("description", "")),
             status=IntentStatus.coerce(data.get("status", IntentStatus.ACTIVE)),
             outcome=IntentOutcome.coerce(data.get("outcome")),
             note=str(data.get("note", "")),
             action_key=str(data.get("action_key", "")),
+            to_fact_ids=targets,
         )
 
 
@@ -453,12 +502,14 @@ class Project:
 
     def _validate_intent_fact_refs(self, intents: Iterable[Intent]) -> None:
         for intent in intents:
-            for attr_name, fact_id in (
-                ("from_fact_id", intent.from_fact_id),
-                ("to_fact_id", intent.to_fact_id),
-            ):
-                if fact_id is not None and fact_id not in self.facts:
-                    raise ValueError(f"intent {attr_name} references unknown fact id: {fact_id}")
+            if intent.from_fact_id is not None and intent.from_fact_id not in self.facts:
+                raise ValueError(f"intent from_fact_id references unknown fact id: {intent.from_fact_id}")
+            targets = list(intent.to_fact_ids)
+            if intent.to_fact_id is not None and intent.to_fact_id not in targets:
+                targets.append(intent.to_fact_id)
+            for fact_id in targets:
+                if fact_id not in self.facts:
+                    raise ValueError(f"intent to_fact_id references unknown fact id: {fact_id}")
 
 
 def _normalize_items(

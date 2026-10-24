@@ -11,6 +11,8 @@ from typing import Callable, Sequence
 
 from echo_agent.config import DispatcherSettings, ProjectResource
 from echo_agent.models import Project, ProjectStatus
+from echo_agent.server.attachments import CONTAINER_ATTACHMENT_DIR
+from echo_agent.server.project_workspace import CONTAINER_WORK_DIR, ProjectWorkspace
 
 
 class DockerRuntimeError(RuntimeError):
@@ -29,6 +31,8 @@ class DockerProjectRuntime:
     resource_root: Path = Path(".echo_agent/resources")
     resources: Sequence[ProjectResource] = ()
     keepalive_command: Sequence[str] = ("sleep", "infinity")
+    attachment_root: Path | None = None
+    workspace: ProjectWorkspace | None = None
 
     @classmethod
     def from_settings(cls, settings: DispatcherSettings | None = None) -> "DockerProjectRuntime":
@@ -64,7 +68,12 @@ class DockerProjectRuntime:
 
     def ensure_project_container(self, project: Project, log: DockerLogCallback | None = None) -> None:
         container = self._container_name(project)
-        mounts = self._prepare_project_resources(project, log=log)
+        mounts = list(self._prepare_project_resources(project, log=log))
+        mounts.extend(self._project_workspace_mounts(project))
+        if self.workspace is None:
+            attachment = self._attachment_mount(project)
+            if attachment is not None:
+                mounts.append(attachment)
         self._ensure_image(log=log)
 
         self._log(log, "docker container inspect started", docker=container)
@@ -242,6 +251,23 @@ class DockerProjectRuntime:
             command.extend(["--network", self.build_network])
         command.extend(["-t", self.image, "-f", str(self.dockerfile), str(self.context)])
         return command
+
+    def _project_workspace_mounts(self, project: Project) -> list[tuple[Path, str, bool]]:
+        if self.workspace is None:
+            return []
+        mounts: list[tuple[Path, str, bool]] = [(self.workspace.work_dir(project), CONTAINER_WORK_DIR, False)]
+        attachments = self.workspace.attachment_dir(project)
+        if attachments is not None:
+            mounts.append((attachments, CONTAINER_ATTACHMENT_DIR, True))
+        return mounts
+
+    def _attachment_mount(self, project: Project) -> tuple[Path, str, bool] | None:
+        if self.attachment_root is None:
+            return None
+        directory = (self.attachment_root / str(project.id)).resolve()
+        if not directory.is_dir() or not any(path.is_file() for path in directory.iterdir()):
+            return None
+        return (directory, CONTAINER_ATTACHMENT_DIR, True)
 
     def _prepare_project_resources(
         self,

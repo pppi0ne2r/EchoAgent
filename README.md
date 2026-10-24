@@ -52,13 +52,13 @@ export ECHO_AGENT_CONFIG=/path/to/echo_agent.toml
 Configuration priority is:
 
 ```text
-environment variables > echo_agent.toml > echo_agent.toml.example
+environment variables > .echo_agent/console_settings.toml > echo_agent.toml > echo_agent.toml.example
 ```
 
 Important sections:
 
 - `[server]`: web UI host, port, database path.
-- `[dispatcher]`: loop interval and explore concurrency.
+- `[dispatcher]`: loop interval, per-project Codex slots, and how many projects may run together.
 - `[codex]`: Codex CLI command, models, provider, retries, timeouts.
 - `[docker]`: worker image build/run settings.
 - `[resources]`: shared resources prepared on startup and mounted into containers.

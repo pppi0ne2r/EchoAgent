@@ -34,6 +34,24 @@ class FirstRunPromptTests(unittest.TestCase):
         self.assertIn('"fact_description"', prompt)
 
 
+    def test_prompts_accept_ip_or_local_target(self) -> None:
+        project, intent = self._project_with_intent()
+        project.target_url = "10.0.0.8"
+        project.hint = "备用账号 admin"
+        project.objective = "拿到 flag"
+
+        first_run = PromptBuilder().build_first_run_prompt(project, intent)  # type: ignore[arg-type]
+        reason = PromptBuilder().build_reason_prompt(project)
+
+        self.assertIn("10.0.0.8", first_run)
+        self.assertIn("备用账号 admin", first_run)
+        self.assertIn("拿到 flag", first_run)
+        self.assertIn("不要假定它一定是网页地址", first_run)
+        self.assertIn("不要假定它一定是网页地址", reason)
+        self.assertIn("备用账号 admin", reason)
+        self.assertIn("拿到 flag", reason)
+
+
 class ReasonContextBudgetTests(unittest.TestCase):
     def test_older_evidence_is_truncated_but_ids_are_kept(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)

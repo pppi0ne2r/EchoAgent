@@ -143,6 +143,7 @@ def _format_worker_context(project: Project) -> str:
     return "\n".join(
         [
             "执行上下文只包含任务信息、已验证证据和已经关闭的动作。",
+            "target_url 可以同时包含 URL、IP 和容器内附件路径，不要假定它一定是网页地址。",
             "closed_actions 只给出 action_key、description、outcome，不包含证伪事实编号。",
             "不要重做 closed_actions 里的动作，也不要根据缺失的事实编号继续扩展。",
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -201,6 +202,7 @@ def _format_project_context(project: Project) -> str:
     return "\n".join(
         [
             "项目上下文分为已知证据、证伪结论、已经做过的动作、不要重复的失败路径、终点说明。",
+            "target_url 可以同时包含 URL、IP 和容器内附件路径，不要假定它一定是网页地址。",
             "evidence 才是已验证事实。新 intent 的 from 只能取 allowed_from。",
             "evidence 为空时，allowed_from 只包含起点，避免没有证据时无法继续规划。",
             "findings 是证伪或错误事实的正文。不能作为 from，也不能换一种说法重做。",
@@ -241,9 +243,15 @@ def _executed_intents(project: Project) -> list[Intent]:
 
 
 def _intent_result(project: Project, intent: Intent) -> tuple[str, str]:
-    if intent.to_fact_id is None:
+    fact_ids = [fact_id for fact_id in intent.to_fact_ids if fact_id in project.facts]
+    if not fact_ids and intent.to_fact_id in project.facts:
+        fact_ids = [intent.to_fact_id]
+    selected = [project.facts[fact_id] for fact_id in fact_ids if project.facts[fact_id].kind != FactKind.GOAL]
+    if not selected and fact_ids:
+        fact = project.facts[fact_ids[-1]]
+        return fact.description, fact.kind.value
+    if not selected:
         return "", ""
-    fact = project.facts.get(intent.to_fact_id)
-    if fact is None:
-        return "", ""
-    return fact.description, fact.kind.value
+    primary = project.facts.get(intent.to_fact_id)
+    kind = primary.kind.value if primary is not None and primary in selected else selected[-1].kind.value
+    return "\n".join(fact.description for fact in selected), kind

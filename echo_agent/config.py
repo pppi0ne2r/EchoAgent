@@ -55,6 +55,7 @@ class DispatcherSettings:
     interval_seconds: float
     explore_max_workers: int
     codex_max_slots: int = 2
+    max_concurrent_projects: int = 2
     codex_model: str | None = None
     codex_first_run_model: str | None = None
     codex_explore_model: str | None = None
@@ -115,6 +116,15 @@ class DispatcherSettings:
                     config,
                     "dispatcher",
                     "codex_max_slots",
+                    default=2,
+                )
+            ),
+            max_concurrent_projects=int(
+                _setting(
+                    "ECHO_AGENT_MAX_CONCURRENT_PROJECTS",
+                    config,
+                    "dispatcher",
+                    "max_concurrent_projects",
                     default=2,
                 )
             ),
@@ -317,6 +327,9 @@ def _load_config() -> dict[str, Any]:
         config_dir = path.resolve().parent
     else:
         config_dir = Path.cwd()
+    console_path = console_settings_path()
+    if console_path.exists():
+        config = _merge_config(config, _read_config_file(console_path))
     if "ECHO_AGENT_DATA_DIR" in os.environ:
         config = _merge_config(
             config,
@@ -327,6 +340,15 @@ def _load_config() -> dict[str, Any]:
         )
     config[CONFIG_DIR_KEY] = config_dir
     return config
+
+
+
+def console_settings_path() -> Path:
+    if data_dir := os.environ.get("ECHO_AGENT_DATA_DIR"):
+        return Path(data_dir) / "console_settings.toml"
+    path = Path(os.environ.get("ECHO_AGENT_CONFIG", DEFAULT_CONFIG_PATH))
+    config_dir = path.resolve().parent if path.exists() else Path.cwd()
+    return config_dir / ".echo_agent" / "console_settings.toml"
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:

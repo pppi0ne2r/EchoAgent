@@ -21,11 +21,14 @@ server_url = "http://127.0.0.1:8000"
 # Delay between dispatch-loop steps.
 interval_seconds = 3.0
 
-# Orchestration concurrency. This can be higher than codex_max_slots.
+# How many intent threads one project may submit at once. Extra intents wait for a Codex slot.
 explore_max_workers = 4
 
-# Simultaneous codex exec calls. Intents without a slot stay active and do not start a process.
+# How many Codex processes one running project may start. This limit is per project.
 codex_max_slots = 2
+
+# How many projects may run at the same time. Projects beyond this stay queued and do not start containers.
+max_concurrent_projects = 2
 
 [codex]
 # Codex CLI command executed inside the project Docker container.
