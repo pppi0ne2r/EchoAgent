@@ -191,6 +191,63 @@ class DispatcherRunnerBudgetTests(unittest.TestCase):
         self.assertEqual(state.last_message, "executed 2 intents, released 0")
 
 
+class DispatcherRunnerWriteupTests(unittest.TestCase):
+    def _run(self, script: list[DispatchResult], starter, max_steps: int = 3) -> DispatcherRunState:
+        _ScriptedDispatcher.script = list(script)
+        _ScriptedDispatcher.calls = 0
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            project = store.create_project(project_id=9, target_url="http://target", objective="get flag")
+            project.activate()
+            store.save_project(project)
+            runner = DispatcherRunner(store, runtime=ForceStopRuntime(), writeup_starter=starter)
+            with patch("echo_agent.server.dispatcher_runner.Dispatcher", _ScriptedDispatcher):
+                state = runner.start(project.id, interval_seconds=0, max_steps=max_steps)
+                thread = runner._runs[project.id].thread
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+                return state
+
+    def test_completed_result_starts_writeup_once(self) -> None:
+        started: list[int] = []
+        state = self._run(
+            [DispatchResult(9, DispatchMode.COMPLETED, ProjectStatus.COMPLETED, "flag found")],
+            started.append,
+        )
+        self.assertEqual(started, [9])
+        self.assertEqual(state.last_message, "flag found")
+
+    def test_skipped_result_does_not_start_writeup(self) -> None:
+        started: list[int] = []
+        self._run(
+            [DispatchResult(9, DispatchMode.SKIPPED, ProjectStatus.RUNNING, "reason made no progress")],
+            started.append,
+        )
+        self.assertEqual(started, [])
+
+    def test_trailing_completed_explore_starts_writeup(self) -> None:
+        started: list[int] = []
+        self._run(
+            [
+                DispatchResult(9, DispatchMode.REASON, ProjectStatus.RUNNING, "planned 1 intents"),
+                DispatchResult(9, DispatchMode.COMPLETED, ProjectStatus.COMPLETED, "flag found"),
+            ],
+            started.append,
+            max_steps=1,
+        )
+        self.assertEqual(started, [9])
+
+    def test_writeup_starter_failure_does_not_break_the_runner(self) -> None:
+        def fail(project_id: int) -> None:
+            raise RuntimeError(f"writeup failed for {project_id}")
+
+        state = self._run(
+            [DispatchResult(9, DispatchMode.COMPLETED, ProjectStatus.COMPLETED, "flag found")],
+            fail,
+        )
+        self.assertEqual(state.last_message, "flag found")
+        self.assertFalse(state.running)
+
 
 if __name__ == "__main__":
     unittest.main()

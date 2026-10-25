@@ -23,7 +23,6 @@ const state = {
   showDetailLogs: false,
   writeupStatus: null,
   writeupTimer: null,
-  writeupDownloadPending: false,
 };
 
 const els = {
@@ -192,7 +191,6 @@ async function selectProject(projectId) {
     state.userGraphZoom = false;
     state.logFollow = true;
     state.writeupStatus = null;
-    state.writeupDownloadPending = false;
     stopWriteupPoll();
     if (els.graphViewport) {
       els.graphViewport.scrollLeft = 0;
@@ -343,9 +341,17 @@ function updateActionButtons() {
     els.uploadForm.querySelector('button[type="submit"]').disabled = !hasProject || state.busy || project.task_type !== "crypto" || canStop || project.status === "completed";
   }
   if (els.exportWriteup) {
-    const generating = state.writeupStatus?.status === "running";
-    els.exportWriteup.disabled = !hasProject || state.busy || generating;
-    els.exportWriteup.textContent = generating ? "生成中" : "导出 WP";
+    const writeupState = state.writeupStatus?.status;
+    const ready = writeupState === "ready";
+    const generating = writeupState === "running";
+    const failed = writeupState === "error";
+    els.exportWriteup.disabled = !hasProject || state.busy || !ready;
+    els.exportWriteup.textContent = generating ? "生成中" : failed ? "生成失败" : "导出 WP";
+    els.exportWriteup.title = failed
+      ? (state.writeupStatus.error || "生成 WP 失败")
+      : ready
+        ? "下载已生成的 WP"
+        : "项目完成后自动生成";
   }
 }
 
@@ -1989,7 +1995,6 @@ function clearCurrentProject() {
   state.logAfterId = 0;
   state.logFollow = true;
   state.writeupStatus = null;
-  state.writeupDownloadPending = false;
   stopWriteupPoll();
   renderRunStatus();
   updateActionButtons();
@@ -2291,11 +2296,16 @@ function ensureWriteupPoll() {
 async function refreshWriteupStatus() {
   if (!state.currentProjectId) return;
   const projectId = state.currentProjectId;
+  const previous = state.writeupStatus?.status;
   const status = await api(`/projects/${projectId}/writeup`);
   if (state.currentProjectId !== projectId) return;
   state.writeupStatus = status;
   updateActionButtons();
   if (status.status === "running") ensureWriteupPoll();
+  else stopWriteupPoll();
+  if (status.status === "error" && previous !== "error") {
+    setStatus(`error · ${status.error || "生成 WP 失败"}`);
+  }
 }
 
 async function downloadWriteup(projectId, filename) {
@@ -2335,34 +2345,23 @@ async function pollWriteup() {
   await loadLogs().catch(() => {});
   const status = state.writeupStatus;
   if (!status || status.status === "running") return;
-  if (previous === "running" && state.writeupDownloadPending && status.status === "ready") {
-    state.writeupDownloadPending = false;
-    await downloadWriteup(projectId, status.filename);
-    setStatus("done · WP 已生成");
-    return;
-  }
-  if (status.status === "error") {
-    state.writeupDownloadPending = false;
-    setStatus(`error · ${status.error || "生成 WP 失败"}`);
+  if (previous === "running" && status.status === "ready") {
+    setStatus("done · WP 已生成，可导出");
   }
 }
 
 els.exportWriteup?.addEventListener("click", async () => {
-  if (!state.currentProjectId || state.writeupStatus?.status === "running") return;
-  let readyNow = false;
-  await withAction("开始生成 WP...", async () => {
-    const status = await api(`/projects/${state.currentProjectId}/writeup`, { method: "POST" });
-    state.writeupStatus = status;
-    state.writeupDownloadPending = status.status === "running";
-    readyNow = status.status === "ready";
-    updateActionButtons();
-  });
-  if (readyNow && state.currentProjectId) {
-    await downloadWriteup(state.currentProjectId, state.writeupStatus?.filename);
-    setStatus("done · WP 已生成");
-    return;
+  if (!state.currentProjectId || state.writeupStatus?.status !== "ready") return;
+  const projectId = state.currentProjectId;
+  const filename = state.writeupStatus?.filename;
+  try {
+    await withAction("下载 WP...", async () => {
+      await downloadWriteup(projectId, filename);
+    });
+    setStatus("done · WP 已下载");
+  } catch (error) {
+    setStatus(`error · ${error.message}`);
   }
-  ensureWriteupPoll();
 });
 
 els.runProject.addEventListener("click", async () => {

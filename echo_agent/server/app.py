@@ -109,11 +109,15 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         CryptoProjectFiles(store.database_path.parent / "projects"),
         aes_image=getattr(app.state.project_runtime, "image", None),
     )
-    app.state.dispatcher_runner = DispatcherRunner(store, runtime=app.state.project_runtime)
     app.state.writeup_service = WriteupService(
         store,
         app.state.workspace,
         app.state.project_runtime,
+    )
+    app.state.dispatcher_runner = DispatcherRunner(
+        store,
+        runtime=app.state.project_runtime,
+        writeup_starter=app.state.writeup_service.start,
     )
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")

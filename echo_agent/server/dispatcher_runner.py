@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -59,11 +60,17 @@ class _QueuedRun:
 
 
 class DispatcherRunner:
-    def __init__(self, store: SQLiteProjectStore, runtime: DockerProjectRuntime | None = None) -> None:
+    def __init__(
+        self,
+        store: SQLiteProjectStore,
+        runtime: DockerProjectRuntime | None = None,
+        writeup_starter: Callable[[int], object] | None = None,
+    ) -> None:
         self.store = store
         self.runtime = runtime or DockerProjectRuntime.from_settings(
             project_data_root=store.database_path.parent / "projects"
         )
+        self.writeup_starter = writeup_starter
         self._lock = threading.Lock()
         self._runs: dict[int, _RunHandle] = {}
         self._queue: dict[int, _QueuedRun] = {}
@@ -471,6 +478,7 @@ class DispatcherRunner:
             dispatcher.request_stop()
         steps = 0
         observed = 0
+        project_completed = False
         try:
             client.add_project_log(
                 project_id,
@@ -508,6 +516,8 @@ class DispatcherRunner:
                         "budget_steps": steps,
                     },
                 )
+                if result.mode.value == "completed":
+                    project_completed = True
                 if result.mode.value in {"completed", "skipped"}:
                     break
                 if step_consumes_budget(result) and max_steps is not None and steps >= max_steps:
@@ -531,6 +541,8 @@ class DispatcherRunner:
                                     "trailing_explore": True,
                                 },
                             )
+                            if trailing.mode.value == "completed":
+                                project_completed = True
                         break
                     break
                 stop_event.wait(interval_seconds)
@@ -553,7 +565,25 @@ class DispatcherRunner:
                 )
             except Exception:
                 pass
+            if project_completed:
+                self._start_writeup(project_id)
             self._promote(ignore=project_id)
+
+    def _start_writeup(self, project_id: int) -> None:
+        starter = self.writeup_starter
+        if starter is None:
+            return
+        try:
+            starter(project_id)
+        except Exception as exc:
+            try:
+                self.store.add_project_log(
+                    project_id,
+                    f"自动生成 WP 失败：{type(exc).__name__}: {exc}",
+                    level="error",
+                )
+            except Exception:
+                return
 
 class StoreDispatcherClient:
     def __init__(self, store: SQLiteProjectStore, runtime: DockerProjectRuntime | None = None) -> None:
