@@ -2643,19 +2643,33 @@ for (const button of els.extensionsPage?.querySelectorAll(".extension-update-all
   });
 }
 for (const form of els.extensionsPage?.querySelectorAll(".extension-form") || []) {
+  const errorNode = form.querySelector(".extension-form-error");
+  const clearFormError = () => {
+    if (!errorNode) return;
+    errorNode.hidden = true;
+    errorNode.textContent = "";
+  };
+  form.querySelector('input[name="url"]')?.addEventListener("input", clearFormError);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    clearFormError();
     const column = form.closest(".extension-column");
     const data = new FormData(form);
-    await withAction("adding extension...", async () => {
-      const kind = column?.dataset.kind;
-      await api("/extensions", {
-        method: "POST",
-        body: JSON.stringify({ kind, url: String(data.get("url") || "").trim() }),
+    try {
+      await withAction("adding extension...", async () => {
+        const kind = column?.dataset.kind;
+        await api("/extensions", {
+          method: "POST",
+          body: JSON.stringify({ kind, url: String(data.get("url") || "").trim() }),
+        });
+        form.reset();
+        await loadExtensions();
       });
-      form.reset();
-      await loadExtensions();
-    });
+    } catch (error) {
+      if (!errorNode) return;
+      errorNode.hidden = false;
+      errorNode.textContent = error.message || "添加失败";
+    }
   });
 }
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EchoAgent Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=34" />
+    <link rel="stylesheet" href="/static/styles.css?v=35" />
   </head>
   <body>
     <header class="topbar">
@@ -53,6 +53,7 @@
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://github.com/owner/repo/archive/refs/heads/main.zip" required />
             <button type="submit">添加</button>
+            <p class="extension-form-error" hidden></p>
           </form>
           <div class="extension-list"></div>
         </section>
@@ -65,6 +66,7 @@
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://github.com/projectdiscovery/katana" required />
             <button type="submit">添加</button>
+            <p class="extension-form-error" hidden></p>
           </form>
           <div class="extension-list"></div>
         </section>
@@ -77,6 +79,7 @@
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://example.com/java-deser/SKILL.md" required />
             <button type="submit">添加</button>
+            <p class="extension-form-error" hidden></p>
           </form>
           <div class="extension-list"></div>
         </section>
@@ -287,6 +290,6 @@
       </form>
     </section>
 
-    <script src="/static/app.js?v=41"></script>
+    <script src="/static/app.js?v=42"></script>
   </body>
 </html>

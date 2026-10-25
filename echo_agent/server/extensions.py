@@ -478,6 +478,7 @@ def parse_github_repo(value: str) -> str:
     text = value.strip().strip("/")
     if not text:
         raise ValueError("请填写 GitHub 仓库链接，例如 https://github.com/projectdiscovery/katana")
+    _reject_tool_release_archive(text)
     text = re.sub(r"^https?://github\.com/", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\.git$", "", text)
     parts = [part for part in text.split("/") if part]
@@ -487,6 +488,16 @@ def parse_github_repo(value: str) -> str:
     if not _REPO_RE.fullmatch(repo):
         raise ValueError("仓库名无效")
     return repo
+
+
+def _reject_tool_release_archive(value: str) -> None:
+    candidate = value if "://" in value else f"https://github.com/{value.lstrip('/')}"
+    path = unquote(urlparse(candidate).path).lower()
+    if "/releases/download/" not in path and "/releases/latest/download/" not in path:
+        return
+    if not path.endswith(_ARCHIVE_SUFFIXES):
+        return
+    raise ValueError("这是 release 压缩包链接。请改填仓库主页，例如 https://github.com/projectdiscovery/katana")
 
 
 def _asset_pattern(name: str) -> str:

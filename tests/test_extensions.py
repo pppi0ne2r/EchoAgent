@@ -419,6 +419,12 @@ class ToolRepoTests(unittest.TestCase):
             parse_github_repo("https://github.com/projectdiscovery/katana/releases/tag/v1.8.0"),
             "projectdiscovery/katana",
         )
+        with self.assertRaises(ValueError) as caught:
+            parse_github_repo(
+                "https://github.com/projectdiscovery/katana/releases/download/v1.8.0/katana_1.8.0_linux_arm64.zip"
+            )
+        self.assertIn("请改填仓库主页", str(caught.exception))
+        self.assertIn("https://github.com/projectdiscovery/katana", str(caught.exception))
         assets = [
             {"name": "katana_1.8.0_linux_amd64.zip", "browser_download_url": "https://example.com/amd64"},
             {"name": "katana_1.8.0_linux_arm64.zip", "browser_download_url": "https://example.com/arm64"},
@@ -488,6 +494,12 @@ class ToolRepoTests(unittest.TestCase):
                 catalog.add_from_link("knowledge", "https://github.com/acme/php-filter")
             with self.assertRaises(ValueError):
                 catalog.add_from_link("skill", "https://github.com/acme/skills/blob/main/SKILL.md")
+            with self.assertRaises(ValueError) as caught:
+                catalog.add_from_link(
+                    "tool",
+                    "https://github.com/hahwul/dalfox/releases/download/v2.12.0/dalfox-linux-arm64.tar.gz",
+                )
+            self.assertIn("请改填仓库主页", str(caught.exception))
 
 
 if __name__ == "__main__":
