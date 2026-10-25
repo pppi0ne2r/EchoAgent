@@ -19,6 +19,7 @@ from echo_agent.server.extensions import (
     builtin_extensions,
     choose_tool_release,
     extension_resource,
+    github_default_branch_archive_url,
     parse_github_repo,
     release_label,
     resolve_latest_release_url,
@@ -563,6 +564,264 @@ class LocalExtensionImportTests(unittest.TestCase):
             self.assertEqual((root / "resources" / "tools" / "local-helper.jar").read_bytes(), b"jar-bytes")
             self.assertEqual((root / "resources" / "knowledges" / "notes.md").read_bytes(), b"notes\n")
             self.assertTrue(tool.url.startswith("file:"))
+
+
+class SkillRepositoryImportTests(unittest.TestCase):
+    def _zip(self, files: dict[str, str]) -> bytes:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            for name, content in files.items():
+                archive.writestr(name, content)
+        return payload.getvalue()
+
+    def _skill(self, name: str) -> str:
+        return f"---\nname: {name}\ndescription: {name} skill\n---\n# {name}\n"
+
+    def _catalog(self, root: Path) -> ExtensionCatalog:
+        return ExtensionCatalog(root / "extensions.json", root / "resources")
+
+    def _runtime(self, root: Path, catalog: ExtensionCatalog) -> DockerProjectRuntime:
+        return DockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+            resource_root=root / "resources",
+            extensions=catalog,
+        )
+
+    def test_repository_homepage_installs_each_top_level_skill(self) -> None:
+        content = self._zip(
+            {
+                "repo-main/README.md": "ignore",
+                "repo-main/ctf-web/SKILL.md": self._skill("ctf-web"),
+                "repo-main/ctf-web/scripts/run.py": "print(1)\n",
+                "repo-main/ctf-pwn/SKILL.md": self._skill("ctf-pwn"),
+                "repo-main/docs/notes.md": "skip",
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content) as download:
+                items = catalog.import_skill_repository("https://github.com/ljagiello/ctf-skills")
+            download.assert_called_once_with("ljagiello/ctf-skills")
+            self.assertEqual([item.name for item in items], ["ctf-pwn", "ctf-web"])
+            self.assertTrue(all(item.github_repo == "" and item.url.startswith("file:") for item in items))
+            runtime = self._runtime(root, catalog)
+            for item in items:
+                self.assertEqual(runtime.update_extensions(item_id=item.id), [])
+            self.assertIn("name: ctf-web", (root / "resources" / "skills" / "ctf-web" / "SKILL.md").read_text())
+            self.assertEqual((root / "resources" / "skills" / "ctf-web" / "scripts" / "run.py").read_text(), "print(1)\n")
+            self.assertTrue((root / "resources" / "skills" / "ctf-pwn" / "SKILL.md").is_file())
+            self.assertFalse((root / "resources" / "skills" / "ctf-skills").exists())
+            self.assertFalse((root / "resources" / "skills" / "docs").exists())
+
+    def test_repository_without_skill_adds_nothing(self) -> None:
+        content = self._zip({"repo-main/README.md": "no skill"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content):
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_skill_repository("https://github.com/acme/empty")
+            self.assertIn("没有可导入的 Skill", str(caught.exception))
+            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+            self.assertFalse((root / "resources" / "imports").exists())
+
+    def test_existing_skill_name_blocks_entire_import(self) -> None:
+        content = self._zip(
+            {
+                "repo-main/ctf-web/SKILL.md": self._skill("ctf-web"),
+                "repo-main/ctf-pwn/SKILL.md": self._skill("ctf-pwn"),
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            catalog.import_local("skill", "SKILL.md", self._skill("ctf-web").encode())
+            before = [item.name for item in catalog.list_items()]
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content):
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_skill_repository("https://github.com/acme/ctf-skills")
+            self.assertIn("already exists", str(caught.exception))
+            self.assertEqual([item.name for item in catalog.list_items()], before)
+            self.assertFalse((root / "resources" / "imports" / "skill" / "ctf-pwn").exists())
+
+    def test_direct_skill_link_still_works_and_knowledge_homepage_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            skill = catalog.add_from_link("skill", "https://example.com/java-deser/SKILL.md")
+            self.assertEqual(skill.name, "java-deser")
+            self.assertEqual(skill.url, "https://example.com/java-deser/SKILL.md")
+            with self.assertRaises(ValueError) as caught:
+                catalog.add_from_link("knowledge", "https://github.com/acme/php-filter")
+            self.assertIn("仓库主页", str(caught.exception))
+            with self.assertRaises(ValueError):
+                catalog.add_from_link("skill", "https://github.com/acme/skills/blob/main/SKILL.md")
+
+    def test_root_skill_archive_stays_one_skill(self) -> None:
+        content = self._zip(
+            {
+                "repo-main/SKILL.md": self._skill("solo"),
+                "repo-main/ctf-web/SKILL.md": self._skill("ctf-web"),
+                "repo-main/notes.md": "keep",
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content):
+                items = catalog.import_skill_repository("https://github.com/acme/solo-skill.git")
+            self.assertEqual([item.name for item in items], ["solo"])
+            runtime = self._runtime(root, catalog)
+            self.assertEqual(runtime.update_extensions(item_id=items[0].id), [])
+            installed = root / "resources" / "skills" / "solo"
+            self.assertTrue((installed / "SKILL.md").is_file())
+            self.assertTrue((installed / "ctf-web" / "SKILL.md").is_file())
+            self.assertEqual((installed / "notes.md").read_text(), "keep")
+            self.assertFalse(any(item.name == "ctf-web" for item in catalog.list_items()))
+
+    def test_invalid_skill_is_skipped_when_another_is_valid(self) -> None:
+        content = self._zip(
+            {
+                "repo-main/ctf-web/SKILL.md": self._skill("ctf-web"),
+                "repo-main/broken/SKILL.md": "# missing frontmatter\n",
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content):
+                items = catalog.import_skill_repository("https://github.com/acme/mixed")
+            self.assertEqual([item.name for item in items], ["ctf-web"])
+
+    def test_invalid_frontmatter_adds_nothing_when_no_skill_is_usable(self) -> None:
+        content = self._zip({"repo-main/ctf-web/SKILL.md": "# missing frontmatter\n"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content):
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_skill_repository("https://github.com/acme/broken")
+            self.assertIn("不会加载", str(caught.exception))
+            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+
+    def test_unsafe_zip_path_adds_nothing(self) -> None:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("repo-main/../../SKILL.md", self._skill("evil"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=payload.getvalue()):
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_skill_repository("https://github.com/acme/evil")
+            self.assertIn("路径不安全", str(caught.exception))
+            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+
+
+class KnowledgeRepositoryImportTests(unittest.TestCase):
+    def test_homepage_tracks_default_branch_archive(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"default_branch": "develop"}).encode()
+
+        self.assertEqual(
+            github_default_branch_archive_url("acme/notes", opener=lambda *_args, **_kwargs: Response()),
+            "https://github.com/acme/notes/archive/refs/heads/develop.zip",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            with patch(
+                "echo_agent.server.extensions.github_default_branch_archive_url",
+                return_value="https://github.com/acme/notes/archive/refs/heads/main.zip",
+            ):
+                item = catalog.import_knowledge_repository("https://github.com/acme/notes")
+            self.assertEqual(item.kind, "knowledge")
+            self.assertEqual(item.name, "notes")
+            self.assertEqual(item.github_repo, "")
+            self.assertEqual(item.url, "https://github.com/acme/notes/archive/refs/heads/main.zip")
+            resource = extension_resource(item)
+            self.assertTrue(resource.archive)
+            self.assertEqual(resource.path, Path("knowledges/notes"))
+            self.assertEqual(resource.container_path, "/home/kali/knowledges/notes")
+
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr("notes-main/README.md", "notes\n")
+                archive.writestr("notes-main/payloads/xss.txt", "payload\n")
+
+            def retrieve(url, filename):
+                self.assertEqual(url, item.url)
+                Path(filename).write_bytes(payload.getvalue())
+                return filename, None
+
+            runtime = DockerProjectRuntime(
+                image="worker:test",
+                context=Path("container"),
+                dockerfile=Path("container/Dockerfile"),
+                resource_root=root / "resources",
+                extensions=catalog,
+            )
+            with patch("echo_agent.server.docker_runtime.urllib.request.urlretrieve", side_effect=retrieve):
+                self.assertEqual(runtime.update_extensions(item_id=item.id), [])
+            installed = root / "resources" / "knowledges" / "notes"
+            self.assertEqual((installed / "README.md").read_text(), "notes\n")
+            self.assertEqual((installed / "payloads" / "xss.txt").read_text(), "payload\n")
+
+    def test_existing_knowledge_name_blocks_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            with patch("echo_agent.server.extensions.github_default_branch_archive_url") as archive:
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_knowledge_repository("https://github.com/projectdiscovery/nuclei-templates")
+            self.assertIn("already exists", str(caught.exception))
+            archive.assert_not_called()
+
+    def test_tool_without_release_uses_default_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            with patch(
+                "echo_agent.server.extensions.resolve_tool_release",
+                side_effect=ExtensionResolveError("example/scripts 最新版本没有可下载资源"),
+            ):
+                with patch(
+                    "echo_agent.server.extensions.github_default_branch_archive_url",
+                    return_value="https://github.com/example/scripts/archive/refs/heads/main.zip",
+                ) as archive:
+                    item = catalog.add_tool_repo("https://github.com/example/scripts")
+            archive.assert_called_once_with("example/scripts")
+            self.assertEqual(item.name, "scripts")
+            self.assertEqual(item.kind, "tool")
+            self.assertEqual(item.github_repo, "")
+            self.assertEqual(item.asset_pattern, "")
+            resource = extension_resource(item)
+            self.assertTrue(resource.archive)
+            self.assertEqual(resource.container_path, "/home/kali/tools/scripts")
+
+    def test_ambiguous_tool_release_does_not_fall_back_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            with patch(
+                "echo_agent.server.extensions.resolve_tool_release",
+                side_effect=ExtensionResolveError("example/tool 匹配到多个 linux/arm64 资源：a.zip、b.zip"),
+            ):
+                with patch("echo_agent.server.extensions.github_default_branch_archive_url") as archive:
+                    with self.assertRaises(ExtensionResolveError):
+                        catalog.add_tool_repo("https://github.com/example/tool")
+            archive.assert_not_called()
+            self.assertFalse(any(item.name == "tool" for item in catalog.list_items()))
 
 
 if __name__ == "__main__":

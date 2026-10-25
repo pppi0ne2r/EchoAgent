@@ -11,7 +11,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from echo_agent.config import ProjectResource
 
@@ -240,7 +240,12 @@ class ExtensionCatalog:
     def add_tool_repo(self, repo: str) -> ExtensionItem:
         parsed = parse_github_repo(repo)
         name = parsed.split("/", 1)[1]
-        url, pattern = resolve_tool_release(parsed)
+        try:
+            url, pattern = resolve_tool_release(parsed)
+        except ExtensionResolveError as exc:
+            if not _tool_release_uses_source(exc):
+                raise
+            return self._add_default_branch_archive("tool", parsed)
         return self.add("tool", name, url, github_repo=parsed, asset_pattern=pattern)
 
     def add_from_link(self, kind: str, link: str) -> ExtensionItem:
@@ -255,6 +260,65 @@ class ExtensionCatalog:
         url = _clean_url(text)
         _reject_webpage_link(url)
         return self.add(cleaned_kind, name_from_download_url(url), url)
+
+    def import_skill_repository(self, link: str) -> list[ExtensionItem]:
+        repo = github_repo_homepage(link)
+        if not repo:
+            raise ValueError("请填写 GitHub 仓库主页，例如 https://github.com/ljagiello/ctf-skills")
+        packages = _skill_packages_from_zip(download_github_zipball(repo))
+        names = [name for name, _payload in packages]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"{duplicates[0]} 在仓库里出现了多次")
+        existing = [item for item in self.list_items() if item.kind == "skill"]
+        existing_names = {item.name for item in existing}
+        existing_slugs = {_slug(item.name) for item in existing}
+        slugs = [_slug(name) for name in names]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("这些 Skill 会安装到同一个目录")
+        for name, slug in zip(names, slugs):
+            if name in existing_names or slug in existing_slugs:
+                raise ValueError(f"{name} already exists")
+        created: list[ExtensionItem] = []
+        written: list[Path] = []
+        try:
+            destinations: list[Path] = []
+            for name, payload in packages:
+                destination = self.resource_root / "imports" / "skill" / _slug(name) / f"{_slug(name)}.zip"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(payload)
+                written.append(destination)
+                destinations.append(destination)
+            for (name, _payload), destination in zip(packages, destinations):
+                created.append(self.add("skill", name, "", local_file=destination))
+        except Exception:
+            for item in created:
+                try:
+                    self.delete(item.id)
+                except KeyError:
+                    pass
+            for path in written:
+                path.unlink(missing_ok=True)
+                parent = path.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            raise
+        return created
+
+    def import_knowledge_repository(self, link: str) -> ExtensionItem:
+        repo = github_repo_homepage(link)
+        if not repo:
+            raise ValueError("请填写 GitHub 仓库主页，例如 https://github.com/swisskyrepo/PayloadsAllTheThings")
+        return self._add_default_branch_archive("knowledge", repo)
+
+    def _add_default_branch_archive(self, kind: str, repo: str) -> ExtensionItem:
+        name = _clean_name(repo.split("/", 1)[1])
+        if any(
+            item.kind == kind and (item.name == name or _slug(item.name) == _slug(name))
+            for item in self.list_items()
+        ):
+            raise ValueError(f"{name} already exists")
+        return self.add(kind, name, github_default_branch_archive_url(repo))
 
     def import_local(self, kind: str, filename: str, content: bytes) -> ExtensionItem:
         cleaned_kind = kind.strip()
@@ -435,6 +499,87 @@ def resolve_tool_release(repo: str, *, opener=None) -> tuple[str, str]:
     return choose_tool_release(assets, repo=parsed)
 
 
+def github_repo_homepage(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    host = (parsed.hostname or "").lower()
+    if host != "github.com" or parsed.scheme not in {"http", "https"}:
+        return None
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    if repo.lower().endswith(".git"):
+        repo = repo[:-4]
+    candidate = f"{owner}/{repo}"
+    if not _REPO_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def github_default_branch_archive_url(repo: str, *, opener=None) -> str:
+    if not _REPO_RE.fullmatch(repo):
+        raise ValueError("仓库名无效")
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "echo-agent",
+        },
+    )
+    open_url = opener or urllib.request.urlopen
+    try:
+        with open_url(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"查询 {repo} 失败：HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"查询 {repo} 失败：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"查询 {repo} 失败：响应不是 JSON 对象")
+    branch = str(payload.get("default_branch") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or any(part in {"", ".", ".."} for part in branch.split("/")):
+        raise ValueError(f"{repo} 没有可用的默认分支")
+    return f"https://github.com/{repo}/archive/refs/heads/{quote(branch, safe='/')}.zip"
+
+
+def download_github_zipball(repo: str, *, opener=None) -> bytes:
+    if not _REPO_RE.fullmatch(repo):
+        raise ValueError("仓库名无效")
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/zipball",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "echo-agent",
+        },
+    )
+    open_url = opener or urllib.request.urlopen
+    try:
+        with open_url(request, timeout=60) as response:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                block = response.read(1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > MAX_IMPORT_BYTES:
+                    raise ValueError("文件不能超过 128MB")
+                chunks.append(block)
+    except ValueError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"下载 {repo} 失败：HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"下载 {repo} 失败：{exc}") from exc
+    data = b"".join(chunks)
+    if not data:
+        raise ValueError(f"下载 {repo} 失败：文件是空的")
+    return data
+
+
 def fetch_latest_release(repo: str, *, opener=None) -> tuple[str, list[object]]:
     if not _REPO_RE.fullmatch(repo):
         raise ExtensionResolveError(f"invalid github repo: {repo}")
@@ -509,6 +654,19 @@ def choose_tool_release(assets: list[object], *, repo: str) -> tuple[str, str]:
         raise ExtensionResolveError(f"{repo} 最新版本没有可下载资源")
     names = "、".join(item[0] for item in usable[:8])
     raise ExtensionResolveError(f"{repo} 没有唯一的 linux/arm64 资源：{names}")
+
+
+def _tool_release_uses_source(exc: ExtensionResolveError) -> bool:
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in (
+            "HTTP 404",
+            "没有可下载资源",
+            "没有资源列表",
+            "没有唯一的 linux/arm64 资源",
+        )
+    )
 
 
 def parse_github_repo(value: str) -> str:
@@ -686,6 +844,97 @@ def _skill_markdown_error(text: str) -> str | None:
     if not block or not _frontmatter_field(block, "name") or not _frontmatter_field(block, "description"):
         return "SKILL.md 必须在开头包含 name 和 description，否则 Codex 不会加载"
     return None
+
+
+def _skill_packages_from_zip(content: bytes) -> list[tuple[str, bytes]]:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("这不是有效的 zip") from exc
+    with archive:
+        members = _zip_relative_files(archive)
+        by_relative = {relative: info for info, relative in members}
+        if "SKILL.md" in by_relative:
+            name = _skill_name_from_member(archive, by_relative["SKILL.md"])
+            return [(name, _repack_zip(archive, members))]
+        groups: dict[str, list[tuple[zipfile.ZipInfo, str]]] = {}
+        for info, relative in members:
+            if "/" not in relative:
+                continue
+            top, rest = relative.split("/", 1)
+            if not top or top in {".", ".."}:
+                continue
+            groups.setdefault(top, []).append((info, rest))
+        valid: list[tuple[str, bytes]] = []
+        invalid_message = ""
+        found_skill = False
+        for top in sorted(groups):
+            grouped = groups[top]
+            skill_info = next((info for info, rest in grouped if rest == "SKILL.md"), None)
+            if skill_info is None:
+                continue
+            found_skill = True
+            try:
+                name = _skill_name_from_member(archive, skill_info)
+            except ValueError as exc:
+                invalid_message = str(exc)
+                continue
+            valid.append((name, _repack_zip(archive, grouped)))
+        if valid:
+            return valid
+        if invalid_message:
+            raise ValueError(invalid_message)
+        if not found_skill:
+            raise ValueError(
+                "仓库里没有可导入的 Skill。SKILL.md 需要放在仓库根目录，或每个一级子目录中，并在开头写上 name 和 description"
+            )
+        raise ValueError("SKILL.md 必须在开头包含 name 和 description，否则 Codex 不会加载")
+
+
+def _zip_relative_files(archive: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
+    infos: list[zipfile.ZipInfo] = []
+    names: list[str] = []
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        raw = info.filename.replace("\\", "/")
+        if _unsafe_archive_name(raw):
+            raise ValueError(f"压缩包路径不安全：{info.filename}")
+        names.append(raw)
+        infos.append(info)
+    prefix = _single_archive_prefix(names)
+    relative_members: list[tuple[zipfile.ZipInfo, str]] = []
+    for info, name in zip(infos, names):
+        relative = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        relative = relative.removeprefix("./")
+        if not relative:
+            continue
+        if _unsafe_archive_name(relative):
+            raise ValueError(f"压缩包路径不安全：{info.filename}")
+        relative_members.append((info, relative))
+    return relative_members
+
+
+def _unsafe_archive_name(name: str) -> bool:
+    if name.startswith(("/", "\\")):
+        return True
+    return any(part == ".." for part in name.split("/"))
+
+
+def _skill_name_from_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
+    text = _decode_skill_markdown(archive.read(info))
+    message = _skill_markdown_error(text)
+    if message:
+        raise ValueError(message)
+    return _clean_name(_frontmatter_field(_frontmatter_block(text), "name"))
+
+
+def _repack_zip(archive: zipfile.ZipFile, members: list[tuple[zipfile.ZipInfo, str]]) -> bytes:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for info, relative in members:
+            output.writestr(relative, archive.read(info))
+    return payload.getvalue()
 
 
 def name_from_download_url(url: str) -> str:

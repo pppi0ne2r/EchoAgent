@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import hashlib
 import re
+import shutil
 import tempfile
 import time
 from dataclasses import is_dataclass, replace
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import uvicorn
@@ -41,7 +43,7 @@ from echo_agent.server.schemas import (
     ProjectStatusRequest,
 )
 from echo_agent.server.dispatcher_runner import DispatcherRunner
-from echo_agent.server.extensions import MAX_IMPORT_BYTES, ExtensionCatalog, ExtensionResolveError
+from echo_agent.server.extensions import MAX_IMPORT_BYTES, ExtensionCatalog, ExtensionResolveError, extension_resource, github_repo_homepage
 from echo_agent.server.writeup import WriteupService
 from echo_agent.storage import ProjectNotFoundError, ProjectConflictError, SQLiteProjectStore
 
@@ -682,17 +684,74 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     def list_extensions() -> list[dict[str, Any]]:
         return app.state.extensions.public_items(app.state.project_runtime._resource_exists)
 
+    def install_imported_extensions(items: list) -> None:
+        for item in items:
+            try:
+                failures = app.state.project_runtime.update_extensions(item_id=item.id)
+            except KeyError as exc:
+                discard_imported_extensions(items)
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="导入安装失败") from exc
+            if failures:
+                discard_imported_extensions(items)
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=failures[0]["error"])
+
+    def discard_imported_extensions(items: list) -> None:
+        root = app.state.extensions.resource_root.resolve()
+        for item in items:
+            host_path = app.state.extensions.host_path(extension_resource(item))
+            try:
+                resolved = host_path.resolve()
+            except OSError:
+                resolved = host_path
+            if resolved != root and root in resolved.parents:
+                if host_path.is_dir() and not host_path.is_symlink():
+                    shutil.rmtree(host_path, ignore_errors=True)
+                elif host_path.is_file() or host_path.is_symlink():
+                    host_path.unlink(missing_ok=True)
+            if str(item.url).startswith("file:"):
+                local = Path(unquote(urlparse(str(item.url)).path))
+                if local.is_file():
+                    local.unlink(missing_ok=True)
+                parent = local.parent
+                try:
+                    if parent.is_dir() and not any(parent.iterdir()):
+                        parent.rmdir()
+                except OSError:
+                    pass
+            try:
+                app.state.extensions.delete(item.id)
+            except KeyError:
+                pass
+
     @app.post("/extensions", status_code=HTTPStatus.CREATED)
     def create_extension(data: ExtensionCreateRequest) -> dict[str, Any]:
         try:
             link = data.url.strip() or data.repo.strip()
-            if data.name.strip() and data.kind != "tool":
-                item = app.state.extensions.add(data.kind, data.name, data.url)
+            skill_repo = data.kind == "skill" and not data.name.strip() and bool(github_repo_homepage(link))
+            knowledge_repo = data.kind == "knowledge" and not data.name.strip() and bool(github_repo_homepage(link))
+            if skill_repo:
+                items = app.state.extensions.import_skill_repository(link)
+            elif knowledge_repo:
+                items = [app.state.extensions.import_knowledge_repository(link)]
+            elif data.name.strip() and data.kind != "tool":
+                items = [app.state.extensions.add(data.kind, data.name, data.url)]
             else:
-                item = app.state.extensions.add_from_link(data.kind, link)
+                items = [app.state.extensions.add_from_link(data.kind, link)]
         except (ValueError, ExtensionResolveError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
-        return next(entry for entry in app.state.extensions.public_items(app.state.project_runtime._resource_exists) if entry["id"] == item.id)
+        if skill_repo or data.kind in {"knowledge", "tool"}:
+            install_imported_extensions(items)
+        public = [
+            next(
+                entry
+                for entry in app.state.extensions.public_items(app.state.project_runtime._resource_exists)
+                if entry["id"] == item.id
+            )
+            for item in items
+        ]
+        if len(public) == 1:
+            return public[0]
+        return {"items": public}
 
     @app.post("/extensions/import", status_code=HTTPStatus.CREATED)
     async def import_extension(request: Request, kind: str, filename: str) -> dict[str, Any]:
