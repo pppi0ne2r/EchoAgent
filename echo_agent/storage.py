@@ -10,7 +10,7 @@ from collections.abc import Callable
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
-from .models import Fact, FactKind, Intent, Project
+from .models import Fact, FactKind, Intent, Project, ProjectStatus
 from .crypto_contract import input_ref, project_crypto
 
 
@@ -60,6 +60,10 @@ class ProjectNotFoundError(KeyError):
 
 class ProjectConflictError(RuntimeError):
     """A stale snapshot or another dispatcher owns this project."""
+
+    def __init__(self, message: str, *, code: str = "conflict") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 _LOCKS_GUARD = threading.Lock()
@@ -225,7 +229,7 @@ class SQLiteProjectStore:
         if not project.project_uid or project.project_uid != row["project_uid"]:
             raise ProjectConflictError("project identity conflict; reload the project before saving")
         if project.revision != row["revision"]:
-            raise ProjectConflictError("project revision conflict; reload the project before saving")
+            raise ProjectConflictError("project revision conflict; reload the project before saving", code="revision")
         if row["status"] == "running" and row["run_owner"] and row["run_owner"] != dispatcher_id:
             if not (force_stop and project.status.value == "stoped"):
                 raise ProjectConflictError("project is owned by another dispatcher; stop it before editing or running")
@@ -236,6 +240,42 @@ class SQLiteProjectStore:
             if row is None:
                 raise ProjectNotFoundError(project.id)
             self._check_write(project, row, dispatcher_id, force_stop)
+
+    def compare_and_set_status(
+        self,
+        project_id: int,
+        expected: ProjectStatus,
+        new: ProjectStatus,
+    ) -> bool:
+        """Update status and revision without rewriting facts or intents."""
+        expected_status = ProjectStatus.coerce(expected)
+        new_status = ProjectStatus.coerce(new)
+        with self.project_lock(project_id), self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, revision, run_owner FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectNotFoundError(project_id)
+            if str(row["status"]) != expected_status.value:
+                return False
+            run_owner = row["run_owner"] if new_status == ProjectStatus.RUNNING else None
+            cursor = conn.execute(
+                """
+                UPDATE projects
+                SET status = ?, revision = revision + 1, run_owner = ?
+                WHERE id = ? AND status = ? AND revision = ?
+                """,
+                (
+                    new_status.value,
+                    run_owner,
+                    project_id,
+                    expected_status.value,
+                    int(row["revision"]),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def save_project(self, project: Project, *, dispatcher_id: str | None = None, force_stop: bool = False) -> Project:
         Project.from_dict(project.to_dict())

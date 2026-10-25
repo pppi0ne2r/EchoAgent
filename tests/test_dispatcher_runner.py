@@ -9,9 +9,9 @@ from unittest.mock import patch
 
 from echo_agent.dispatcher.types import DispatchMode, DispatchResult
 from echo_agent.models import ProjectStatus
-from echo_agent.server.dispatcher_runner import DispatcherRunner, DispatcherRunState, _RunHandle
+from echo_agent.server.dispatcher_runner import DispatcherRunner, DispatcherRunState, StoreDispatcherClient, _RunHandle
 from echo_agent.server.docker_runtime import DockerProjectRuntime
-from echo_agent.storage import SQLiteProjectStore
+from echo_agent.storage import ProjectConflictError, SQLiteProjectStore
 
 
 class ForceStopRuntime(DockerProjectRuntime):
@@ -128,6 +128,60 @@ class DispatcherRunnerStopTests(unittest.TestCase):
             finally:
                 release.set()
                 thread.join(timeout=1)
+
+
+    def test_stop_keeps_facts_committed_while_the_container_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            project = store.create_project(project_id=7, target_url="http://target", objective="get flag")
+            project.activate()
+            project.start()
+            store.save_project(project)
+
+            class ProgressRuntime(ForceStopRuntime):
+                def apply_status_transition(self, project, previous_status, log=None):
+                    latest = store.get_project(project.id)
+                    latest.add_fact("committed during stop")
+                    store.save_project(latest)
+                    return super().apply_status_transition(project, previous_status, log=log)
+
+            runner = DispatcherRunner(store, runtime=ProgressRuntime())
+            runner.stop(project.id)
+
+            saved = store.get_project(project.id)
+            descriptions = [fact.description for fact in saved.facts.values()]
+            self.assertEqual(saved.status, ProjectStatus.STOPED)
+            self.assertIn("committed during stop", descriptions)
+            self.assertIn(0, saved.facts)
+            self.assertIn(1, saved.facts)
+            self.assertIsNone(saved.run_owner)
+
+    def test_dispatcher_save_rebases_inflight_progress_after_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            project = store.create_project(project_id=7, target_url="http://target", objective="get flag")
+            project.activate()
+            project.start()
+            store.save_project(project)
+            runtime = ForceStopRuntime()
+            client = StoreDispatcherClient(store, runtime)
+            inflight = client.get_project(project.id)
+            inflight.add_fact("inflight result")
+            stale = store.get_project(project.id)
+            stale.add_fact("stale writer")
+            self.assertTrue(store.compare_and_set_status(project.id, ProjectStatus.RUNNING, ProjectStatus.STOPED))
+            with self.assertRaises(ProjectConflictError):
+                store.save_project(stale)
+            saved = client.save_project(inflight)
+
+            again = store.get_project(project.id)
+            descriptions = [fact.description for fact in again.facts.values()]
+            self.assertEqual(saved.status, ProjectStatus.STOPED)
+            self.assertEqual(again.status, ProjectStatus.STOPED)
+            self.assertIn("inflight result", descriptions)
+            self.assertNotIn("stale writer", descriptions)
+            self.assertEqual(runtime.commands, [])
+            self.assertEqual(again.revision, inflight.revision)
 
 
 class _ScriptedDispatcher:

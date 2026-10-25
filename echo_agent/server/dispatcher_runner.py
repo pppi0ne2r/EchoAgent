@@ -8,11 +8,11 @@ from uuid import uuid4
 from echo_agent.config import DispatcherSettings
 from echo_agent.dispatcher import Dispatcher
 from echo_agent.dispatcher.core import step_consumes_budget, step_requests_trailing_explore
-from echo_agent.models import Project, ProjectStatus
+from echo_agent.models import Fact, Intent, IntentStatus, Project, ProjectStatus
 from echo_agent.crypto_files import CryptoProjectFiles
 from echo_agent.crypto_service import CryptoProjectService
 from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
-from echo_agent.storage import ProjectNotFoundError, SQLiteProjectStore
+from echo_agent.storage import ProjectConflictError, ProjectNotFoundError, SQLiteProjectStore
 
 
 _STEP_MODE_LABELS = {
@@ -261,10 +261,11 @@ class DispatcherRunner:
         project = self.store.get_project(project_id)
         if project.status != ProjectStatus.RUNNING:
             return
-        old_status = project.status
-        project.stop()
+        stopped = Project.from_dict(project.to_dict())
+        stopped.stop()
         self.runtime.apply_status_transition(
-            project, old_status,
+            stopped,
+            project.status,
             log=lambda message, level="info", metadata=None: self.store.add_project_log(
                 project.id,
                 message,
@@ -272,12 +273,18 @@ class DispatcherRunner:
                 metadata=metadata or {},
             ),
         )
+        changed = self.store.compare_and_set_status(
+            project_id,
+            ProjectStatus.RUNNING,
+            ProjectStatus.STOPED,
+        )
+        if not changed:
+            return
         self.store.add_project_log(
             project.id,
             "project status transition: running -> stoped",
             metadata={"old_status": "running", "new_status": "stoped", "forced": False},
         )
-        self.store.save_project(project, force_stop=True)
 
     def status(self, project_id: int) -> DispatcherRunState:
         with self._lock:
@@ -585,6 +592,35 @@ class DispatcherRunner:
             except Exception:
                 return
 
+
+_INTENT_PROGRESS = {
+    IntentStatus.ACTIVE: 0,
+    IntentStatus.RUNNING: 1,
+    IntentStatus.FAILED: 2,
+    IntentStatus.COMPLETED: 3,
+}
+
+
+def _rebase_unsaved_progress(current: Project, incoming: Project) -> None:
+    """Keep committed graph progress, then overlay facts and intents not yet saved."""
+    for fact in current.facts.values():
+        incoming.facts.setdefault(fact.id, Fact.from_dict(fact.to_dict()))
+    for intent in current.intents.values():
+        existing = incoming.intents.get(intent.id)
+        if existing is None or _INTENT_PROGRESS[intent.status] > _INTENT_PROGRESS[existing.status]:
+            incoming.intents[intent.id] = Intent.from_dict(intent.to_dict())
+    if incoming.status == ProjectStatus.RUNNING and current.status in {
+        ProjectStatus.STOPED,
+        ProjectStatus.COMPLETED,
+    }:
+        incoming.status = current.status
+    preserved = current.crypto.get("acceptances")
+    if preserved and incoming.crypto.get("acceptances") != preserved:
+        incoming.crypto["acceptances"] = list(preserved)
+    incoming.revision = current.revision
+    incoming.project_uid = current.project_uid
+
+
 class StoreDispatcherClient:
     def __init__(self, store: SQLiteProjectStore, runtime: DockerProjectRuntime | None = None) -> None:
         self.store = store
@@ -620,7 +656,66 @@ class StoreDispatcherClient:
 
     def save_project(self, project: Project) -> Project:
         with self.store.project_lock(project.id):
-            return self._save_project_locked(project)
+            try:
+                return self._save_project_locked(project)
+            except ProjectConflictError as exc:
+                if getattr(exc, "code", "") != "revision":
+                    raise
+                current = self.store.get_project(project.id)
+                _rebase_unsaved_progress(current, project)
+                self.add_project_log(
+                    project.id,
+                    "dispatcher save rebased onto newer project revision",
+                    level="warning",
+                    metadata={"revision": current.revision, "status": project.status.value},
+                )
+                return self._save_project_locked(project)
+
+    def cas_project_status(
+        self,
+        project_id: int,
+        expected: ProjectStatus,
+        new: ProjectStatus,
+    ) -> bool:
+        with self.store.project_lock(project_id):
+            current = self.store.get_project(project_id)
+            if current.status != expected:
+                return False
+            updated = Project.from_dict(current.to_dict())
+            updated.transition_to(new)
+            if current.status != updated.status:
+                self.add_project_log(
+                    project_id,
+                    f"project status transition: {current.status.value} -> {updated.status.value}",
+                    metadata={"old_status": current.status.value, "new_status": updated.status.value},
+                )
+            try:
+                self.runtime.apply_status_transition(
+                    updated,
+                    current.status,
+                    log=lambda message, level="info", metadata=None: self.add_project_log(
+                        project_id,
+                        message,
+                        level=level,
+                        metadata=metadata or {},
+                    ),
+                )
+            except DockerRuntimeError as exc:
+                self.add_project_log(
+                    project_id,
+                    f"project container lifecycle failed for {updated.status.value}: {exc}",
+                    level="error",
+                    metadata={"docker": current.docker, "status": updated.status.value},
+                )
+                raise
+            changed = self.store.compare_and_set_status(project_id, expected, new)
+            if changed and current.status != updated.status:
+                self.add_project_log(
+                    project_id,
+                    f"project container lifecycle applied for {updated.status.value}",
+                    metadata={"docker": current.docker, "status": updated.status.value},
+                )
+            return changed
 
     def _save_project_locked(self, project: Project) -> Project:
         old_project = self.store.get_project(project.id)

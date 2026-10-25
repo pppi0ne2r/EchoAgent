@@ -1951,6 +1951,12 @@ class Dispatcher:
         return DispatchResult(project.id, DispatchMode.SKIPPED, project.status, message)
 
     def _release_project_if_running(self, project_id: int) -> None:
+        cas_status = getattr(self.client, "cas_project_status", None)
+        if callable(cas_status):
+            changed = cas_status(project_id, ProjectStatus.RUNNING, ProjectStatus.STOPED)
+            if changed:
+                self._log(project_id, "project released to stoped", "info")
+            return
         project = self.client.get_project(project_id)
         if project.status == ProjectStatus.RUNNING:
             self._release_project(project)
