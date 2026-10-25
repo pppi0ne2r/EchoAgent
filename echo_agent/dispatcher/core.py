@@ -900,7 +900,11 @@ class Dispatcher:
                     note="execution timed out after partial facts were saved; intent left incomplete",
                 )
             return
-        for prior in result.prior_results:
+        existing_fact_ids = set(project.facts)
+        priors = result.prior_results
+        if result.outcome != "error":
+            priors = Dispatcher._without_duplicate_answers(priors, result)
+        for prior in priors:
             Dispatcher._add_prior_fact(project, prior, intent.from_fact_id)
         if result.outcome == "error":
             Dispatcher._persist_json_facts_from_detail(project, result.detail, intent.from_fact_id)
@@ -917,6 +921,11 @@ class Dispatcher:
             fact = project.add_fact(fact_text, kind=FactKind.REFUTED)
             intent.mark_completed(to_fact_id=fact.id, outcome=IntentOutcome.REFUTED)
             return
+        new_facts = [project.facts[fact_id] for fact_id in project.facts if fact_id not in existing_fact_ids]
+        if Dispatcher._final_answer_already_recorded(result, new_facts):
+            if intent.status == IntentStatus.RUNNING and new_facts:
+                intent.mark_completed(to_fact_id=new_facts[-1].id, outcome=IntentOutcome.VERIFIED)
+            return
         fact_text = Dispatcher._worker_result_fact_text(result)
         if fact_text:
             fact = project.add_fact(fact_text, kind=FactKind.EVIDENCE)
@@ -925,6 +934,54 @@ class Dispatcher:
         if intent.status == IntentStatus.RUNNING:
             intent.mark_failed(IntentOutcome.EMPTY, note="intent returned no fact or answer")
 
+
+
+    @staticmethod
+    def _answer_covered_by_facts(answer: str | None, fact_texts: list[str]) -> bool:
+        if not answer:
+            return False
+        needle = answer.strip()
+        if not needle:
+            return False
+        return any(needle in text for text in fact_texts)
+
+    @staticmethod
+    def _without_duplicate_answers(
+        priors: list[WorkerObservation],
+        result: WorkerResult,
+    ) -> list[WorkerObservation]:
+        fact_texts: list[str] = []
+        for prior in priors:
+            text = _optional_fact_description(prior.fact_description)
+            if text:
+                fact_texts.append(text)
+        final_text = _optional_fact_description(result.fact_description)
+        if final_text:
+            fact_texts.append(final_text)
+        kept: list[WorkerObservation] = []
+        for prior in priors:
+            if (
+                not _optional_fact_description(prior.fact_description)
+                and prior.answer
+                and prior.outcome != "refuted"
+                and Dispatcher._answer_covered_by_facts(prior.answer, fact_texts)
+            ):
+                continue
+            kept.append(prior)
+        return kept
+
+    @staticmethod
+    def _final_answer_already_recorded(result: WorkerResult, new_facts: list[object]) -> bool:
+        if _optional_fact_description(result.fact_description) or not result.answer:
+            return False
+        if result.outcome == "refuted":
+            return False
+        texts = [
+            str(getattr(fact, "description", ""))
+            for fact in new_facts
+            if getattr(fact, "kind", None) == FactKind.EVIDENCE
+        ]
+        return Dispatcher._answer_covered_by_facts(result.answer, texts)
 
     @staticmethod
     def _store_worker_observations(

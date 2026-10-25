@@ -1136,6 +1136,51 @@ class GraphContractTests(unittest.TestCase):
         self.assertEqual(len(project.intents), 1)
         self.assertNotIn(1, intent.to_fact_ids)
 
+    def test_answer_only_json_does_not_duplicate_fact_that_already_contains_flag(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("初始探测", from_fact_id=0, to_fact_id=1)
+        intent.mark_running()
+        result = WorkerResult(
+            answer="flag{ok}",
+            outcome="verified",
+            prior_results=[
+                WorkerObservation(
+                    fact_description="利用路径得到 flag{ok}",
+                    outcome="verified",
+                )
+            ],
+        )
+
+        Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
+
+        self.assertEqual([fact.description for fact in project.facts.values() if fact.id >= 2], ["利用路径得到 flag{ok}"])
+        self.assertNotIn("agent reported possible final answer", project.facts[2].description)
+        self.assertEqual(intent.outcome, IntentOutcome.VERIFIED)
+        self.assertEqual(intent.to_fact_ids, (2,))
+
+    def test_answer_only_prior_is_dropped_when_final_fact_contains_flag(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("初始探测", from_fact_id=0, to_fact_id=1)
+        intent.mark_running()
+        result = WorkerResult(
+            fact_description="利用路径得到 flag{ok}",
+            outcome="verified",
+            answer="flag{ok}",
+            prior_results=[
+                WorkerObservation(answer="flag{ok}", outcome="verified"),
+            ],
+        )
+
+        Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
+
+        descriptions = [fact.description for fact in project.facts.values() if fact.id >= 2]
+        self.assertEqual(descriptions, ["利用路径得到 flag{ok}"])
+        self.assertEqual(intent.to_fact_ids, (2,))
+
     def test_multiple_targets_round_trip_through_storage(self) -> None:
         import tempfile
         from pathlib import Path
@@ -1680,7 +1725,7 @@ class OuterLoopFixTests(unittest.TestCase):
         self.assertNotIn('"do_not_repeat"', prompt)
         self.assertNotIn('"id": 3', prompt)
         self.assertIn("发现上传点", prompt)
-        self.assertIn("立刻输出 JSON", prompt)
+        self.assertIn("就输出一条 JSON", prompt)
         self.assertIn("outcome=refuted", prompt)
         self.assertIn("检查上传点", prompt)
 
