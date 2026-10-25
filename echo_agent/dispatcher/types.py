@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from echo_agent.models import Intent, Project, ProjectStatus
 
@@ -21,6 +21,7 @@ class WorkerObservation:
     fact_description: str | None = None
     outcome: str | None = None
     answer_source: str | None = None
+    crypto: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -33,6 +34,8 @@ class WorkerResult:
     prior_results: list[WorkerObservation] = field(default_factory=list)
     answer_source: str | None = None
     timed_out: bool = False
+    crypto: dict[str, Any] = field(default_factory=dict)
+    rejected: list[str] = field(default_factory=list)
 
     @property
     def has_answer(self) -> bool:
@@ -76,6 +79,7 @@ class AgentRunResult:
     salvaged: bool = False
     timed_out: bool = False
     raw_output: str = ""
+    limit_reason: str | None = None
 
 
 AgentLogCallback = Callable[[str, str, dict[str, object] | None], None]

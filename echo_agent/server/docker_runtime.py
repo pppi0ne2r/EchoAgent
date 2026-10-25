@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from echo_agent.config import DispatcherSettings, ProjectResource
+from echo_agent.config import ServerSettings
+from echo_agent.crypto_files import CryptoProjectFiles
+from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, DEFAULT_MEMORY_MB
 from echo_agent.models import Project, ProjectStatus
 
 
@@ -27,11 +30,16 @@ class DockerProjectRuntime:
     dockerfile: Path
     build_network: str | None = "host"
     resource_root: Path = Path(".echo_agent/resources")
+    project_data_root: Path = Path(".echo_agent/projects")
     resources: Sequence[ProjectResource] = ()
     keepalive_command: Sequence[str] = ("sleep", "infinity")
 
     @classmethod
-    def from_settings(cls, settings: DispatcherSettings | None = None) -> "DockerProjectRuntime":
+    def from_settings(
+        cls,
+        settings: DispatcherSettings | None = None,
+        project_data_root: Path | None = None,
+    ) -> "DockerProjectRuntime":
         settings = settings or DispatcherSettings.from_env()
         return cls(
             image=settings.project_docker_image,
@@ -39,6 +47,7 @@ class DockerProjectRuntime:
             dockerfile=settings.project_dockerfile,
             build_network=settings.project_docker_build_network,
             resource_root=settings.project_resource_root,
+            project_data_root=project_data_root or ServerSettings.from_env().database_path.parent / "projects",
             resources=settings.project_resources,
         )
 
@@ -73,7 +82,7 @@ class DockerProjectRuntime:
         if state is None:
             self._log(log, "docker container create/start started", docker=container, image=self.image)
             self._run(
-                self._docker_run_command(container, mounts),
+                self._docker_run_command(container, mounts, crypto=project.task_type == "crypto"),
                 log=log,
                 output_prefix="docker run",
             )
@@ -100,7 +109,8 @@ class DockerProjectRuntime:
             return
         self._prepare_resources_at_root(Path(root_template), log=log)
 
-    def _docker_run_command(self, container: str, mounts: Sequence[tuple[Path, str, bool]]) -> list[str]:
+    def _docker_run_command(self, container: str, mounts: Sequence[tuple[Path, str, bool]],
+                            *, crypto: bool = False) -> list[str]:
         command = [
                     "docker",
                     "run",
@@ -112,6 +122,10 @@ class DockerProjectRuntime:
                     "--add-host",
                     "gateway.docker.internal:127.0.0.1",
         ]
+        if crypto:
+            command.extend(["--init", "--memory", f"{DEFAULT_MEMORY_MB}m",
+                            "--memory-swap", f"{DEFAULT_MEMORY_MB}m",
+                            "--pids-limit", str(CRYPTO_PIDS_LIMIT), "--cpus", "2"])
         for host_path, container_path, read_only in mounts:
             mode = "ro" if read_only else "rw"
             command.extend(["-v", f"{host_path}:{container_path}:{mode}"])
@@ -231,6 +245,7 @@ class DockerProjectRuntime:
             recent_output.append(line)
             self._log(log, f"{output_prefix}: {self._truncate(line)}", metadata={"command": list(command)})
 
+        process.stdout.close()
         return_code = process.wait()
         if return_code != 0:
             detail = "\n".join(recent_output) or f"exit code {return_code}"
@@ -248,10 +263,37 @@ class DockerProjectRuntime:
         project: Project,
         log: DockerLogCallback | None = None,
     ) -> list[tuple[Path, str, bool]]:
-        if not self.resources:
-            return []
-        root = self._project_resource_root(project)
-        return self._prepare_resources_at_root(root, log=log)
+        mounts: list[tuple[Path, str, bool]] = []
+        if self.resources:
+            root = self._project_resource_root(project)
+            mounts.extend(self._prepare_resources_at_root(root, log=log))
+        if project.task_type == "crypto":
+            try:
+                files = CryptoProjectFiles(self.project_data_root)
+                inputs, intents = files.ensure_layout(project.id)
+                for ref in project.crypto.get("inputs", []):
+                    files.verify_ref(project.id, ref, "input")
+                destinations = {container_path for _, container_path, _ in mounts}
+                crypto_destinations = {
+                    "/home/kali/workspace/inputs",
+                    "/home/kali/workspace/intents",
+                }
+                if any(
+                    destination == crypto_path
+                    or destination.startswith(f"{crypto_path}/")
+                    or crypto_path.startswith(f"{destination.rstrip('/')}/")
+                    for destination in destinations
+                    for crypto_path in crypto_destinations
+                ):
+                    raise ValueError("crypto workspace mount conflicts with a configured resource")
+            except (ValueError, FileNotFoundError) as exc:
+                raise DockerRuntimeError(str(exc)) from exc
+            mounts.extend([
+                (inputs, "/home/kali/workspace/inputs", True),
+                (intents, "/home/kali/workspace/intents", False),
+            ])
+            self._log(log, "crypto project files prepared", metadata={"project_id": project.id})
+        return mounts
 
     def _prepare_resources_at_root(
         self,

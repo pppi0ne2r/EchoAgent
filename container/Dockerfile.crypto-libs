@@ -1,0 +1,17 @@
+# Incremental worker image build used when the Kali apt mirror is unreachable.
+# It is based on the validated crypto image and only adds the pinned Python
+# packages plus the latest agent guidance.  Prefer Dockerfile for a clean rebuild.
+FROM echo-agent-worker:crypto-20261022
+
+USER root
+COPY ./crypto-requirements.txt /tmp/crypto-requirements.txt
+COPY ./crypto_selfcheck.py /usr/local/share/echo-agent/crypto_selfcheck.py
+COPY ./AGENTS.md /home/kali/workspace/AGENTS.md
+COPY ./.agents /home/kali/workspace/.agents
+
+USER kali
+RUN pip3 install --break-system-packages --user --no-cache-dir --only-binary=:all: \
+      -r /tmp/crypto-requirements.txt && \
+    /usr/bin/python3 /usr/local/share/echo-agent/crypto_selfcheck.py
+
+WORKDIR /home/kali/workspace

@@ -11,6 +11,7 @@ TEMPLATE_REASON_INTENTS: tuple[tuple[str, str], ...] = (
     ("check-upload", "分析是否存在文件上传漏洞"),
     ("enum-backup", "枚举 Web 目录和敏感备份文件"),
 )
+CRYPTO_TEMPLATE_REASON_INTENT = ("check-shared-factor", "对指定两个模数计算 gcd，并记录等式与输入来源")
 
 
 class ReasonFormatError(ValueError):
@@ -27,38 +28,77 @@ class ReasonFormatError(ValueError):
 def is_template_reason_intent(item: dict[str, object]) -> bool:
     description = " ".join(str(item.get("description") or "").split())
     action_key = normalize_action_key(item.get("action_key"))
-    return (action_key, description) in TEMPLATE_REASON_INTENTS
+    return (action_key, description) in (*TEMPLATE_REASON_INTENTS, CRYPTO_TEMPLATE_REASON_INTENT)
 
 
 def parse_worker_result(output: str) -> WorkerResult:
     slices = extract_mode_json_outputs(output, "explore")
     if not slices:
         raise ValueError("explore output does not contain a JSON object")
-    parsed = []
-    for raw in slices:
-        data = json.loads(raw)
+    parsed: list[WorkerResult] = []
+    rejected: list[str] = []
+    for index, raw in enumerate(slices):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            rejected.append(f"object {index}: invalid JSON: {exc}")
+            continue
+        if not isinstance(data, dict):
+            rejected.append(f"object {index}: JSON object required")
+            continue
         if is_template_worker_payload(data):
             continue
-        parsed.append(_worker_result_from_data(data))
+        try:
+            parsed.append(_worker_result_from_data(data))
+        except ValueError as exc:
+            # One malformed object must not discard the rest of the batch.
+            rejected.append(f"object {index}: {exc}")
+    if not parsed:
+        if rejected:
+            raise ValueError(
+                "worker output objects were all rejected: " + "; ".join(rejected[:3])
+            )
+        return WorkerResult()
     meaningful = [item for item in parsed if item.fact_description or item.answer or item.outcome]
     if not meaningful:
-        return WorkerResult()
-    last = meaningful[-1]
+        return WorkerResult(rejected=rejected)
+    # A hypothesis is context for later steps, never the intent's final result. Keeping it
+    # out of the "last wins" slot preserves the real observation even when the model emits
+    # the hypothesis last (the shape that used to discard a whole batch).
+    last_index = _last_primary_index(meaningful)
+    last = meaningful[last_index]
     priors = [
         WorkerObservation(
             answer=item.answer,
             fact_description=item.fact_description,
             outcome=item.outcome,
+            crypto=item.crypto,
         )
-        for item in meaningful[:-1]
-        if item.fact_description or item.answer
+        for index, item in enumerate(meaningful)
+        if index != last_index and (item.fact_description or item.answer)
     ]
     return WorkerResult(
         answer=last.answer,
         fact_description=last.fact_description,
         outcome=last.outcome,
         prior_results=priors,
+        crypto=last.crypto,
+        rejected=rejected,
     )
+
+
+def _last_primary_index(items: list[WorkerResult]) -> int:
+    for index in range(len(items) - 1, -1, -1):
+        if not _is_crypto_hypothesis(items[index]):
+            return index
+    # Only hypotheses were emitted: keep the last one so it is still recorded as pending,
+    # rather than silently dropping the model's output.
+    return len(items) - 1
+
+
+def _is_crypto_hypothesis(item: WorkerResult) -> bool:
+    fact = item.crypto.get("fact") if isinstance(item.crypto, dict) else None
+    return isinstance(fact, dict) and fact.get("claim_status") == "hypothesis"
 
 
 def _worker_result_from_data(data: dict[str, object]) -> WorkerResult:
@@ -70,6 +110,7 @@ def _worker_result_from_data(data: dict[str, object]) -> WorkerResult:
         answer=answer,
         fact_description=fact_description,
         outcome=_optional_worker_outcome(data.get("outcome")),
+        crypto=_optional_crypto_object(data.get("crypto")),
     )
 
 
@@ -81,7 +122,12 @@ def parse_reason_result(output: str) -> ReasonResult:
     intents = _parse_reason_intents(data)
     kept = [item for item in intents if not is_template_reason_intent(item)]
     if intents and not kept and not completed:
-        raise ValueError("reason output only contains prompt template intents")
+        # The tail is where the real upstream/process error usually is; the head is prompt echo.
+        excerpt = " ".join(output.split())[-400:]
+        raise ValueError(
+            "reason output only contains prompt template intents; raw output excerpt: "
+            + (excerpt or "<empty>")
+        )
     return ReasonResult(
         completed=completed,
         next_intent_descriptions=[str(item["description"]) for item in kept],
@@ -165,7 +211,7 @@ def _matches_mode(value: dict[str, object], mode: Literal["explore", "reason"]) 
         return "completed" in value and (
             "next_intents" in value or "next_intent_descriptions" in value
         )
-    return "answer" in value or "fact_description" in value
+    return "answer" in value or "fact_description" in value or ("outcome" in value and "crypto" in value)
 
 
 def extract_mode_json_output(output: str, mode: Literal["explore", "reason"]) -> str | None:
@@ -231,15 +277,30 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
         description = _optional_str(item.get("description"))
         if not description:
             raise ValueError("reason output next_intents object description is required")
+        standard = {"description", "from", "to", "action_key", "crypto"}
+        extra = {key: value for key, value in item.items() if key not in standard}
         intents.append(
             {
                 "description": description,
                 "from": _optional_int(item.get("from")),
                 "to": _optional_int(item.get("to")),
                 "action_key": _optional_reason_text(item.get("action_key"), "action_key"),
+                **({"crypto": _optional_crypto_object(item["crypto"])} if "crypto" in item else {}),
+                # Keep misplaced top-level fields (for example budget) so the dispatcher can
+                # either migrate them with a warning or reject them explicitly.  Silently
+                # dropping them made "increase the budget" plans revert to the default limit.
+                **extra,
             }
         )
     return intents
+
+
+def _optional_crypto_object(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError("crypto output metadata must be a JSON object")
+    return value
 
 
 def _optional_int(value: object) -> int | None:
@@ -276,9 +337,14 @@ def _optional_worker_outcome(value: object) -> str | None:
     if value is None:
         return None
     text = str(value).strip().lower()
-    if text in {"verified", "refuted"}:
+    if text in {"verified", "refuted", "error"}:
         return text
-    raise ValueError("worker output outcome must be verified or refuted")
+    if text in {"inconclusive", "hypothesis"}:
+        # Trust is carried by crypto.fact.claim_status; these words mean "not established",
+        # which is exactly the error outcome. Accepting them keeps a hypothesis object from
+        # discarding the rest of the batch.
+        return "error"
+    raise ValueError("worker output outcome must be verified, refuted or error")
 
 
 def _optional_fact_description(value: object) -> str | None:
@@ -297,6 +363,7 @@ def _optional_fact_description(value: object) -> str | None:
         "写入你实际验证得到的具体事实；不要照抄本句",
         "写入你本次 intent 实际验证得到的具体事实；不要照抄本句",
         "该方向已验证不存在可利用点",
+        "示例事实；不要照抄",
     }
     if normalized in placeholder_facts:
         return None
@@ -347,6 +414,11 @@ def strip_result_json_text(text: str) -> str:
 
 
 def is_template_worker_payload(data: dict[str, object]) -> bool:
+    if data.get("template") is True:
+        return True
+    crypto = data.get("crypto")
+    if isinstance(crypto, dict) and crypto.get("exit_reason"):
+        return False
     if _optional_fact_description(data.get("fact_description")) is not None:
         return False
     if _optional_answer(data.get("answer")) is not None:
@@ -363,7 +435,10 @@ def substantive_worker_output(output: str) -> str | None:
             continue
         if not isinstance(data, dict) or is_template_worker_payload(data):
             continue
-        result = _worker_result_from_data(data)
+        try:
+            result = _worker_result_from_data(data)
+        except ValueError:
+            continue
         if result.fact_description or result.answer:
             kept.append(raw)
     if not kept:
@@ -394,6 +469,7 @@ def strip_prompt_template_text(text: str) -> str:
         "写入你实际验证得到的具体事实；不要照抄本句",
         "写入你本次 intent 实际验证得到的具体事实；不要照抄本句",
         "初始执行得到的新事实",
+        "示例事实；不要照抄",
     ):
         cleaned = cleaned.replace(phrase, " ")
     return " ".join(cleaned.split())

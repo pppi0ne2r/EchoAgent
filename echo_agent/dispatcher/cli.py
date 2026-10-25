@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 from echo_agent.config import DispatcherSettings
+from echo_agent.crypto_files import MAX_INPUT_BYTES, safe_input_filename
+from echo_agent.crypto_contract import ANSWER_FORMS, HASH_ALGORITHMS, crypto_goal
 from echo_agent.dispatcher.client import ProjectClient
 from echo_agent.dispatcher.core import Dispatcher
 
@@ -20,6 +23,22 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--id", type=int, dest="project_id")
     create.add_argument("--docker")
     create.add_argument("--target-url")
+    create.add_argument("--task-type", choices=("general", "crypto"), default="general")
+    create.add_argument("--answer-kind", choices=("plaintext", "factors", "private_exponent"))
+    create.add_argument("--solution-policy", choices=("unique", "any"))
+    create.add_argument("--answer-encoding", choices=("decimal", "hex", "utf8"))
+    create.add_argument("--answer-byte-length", type=int)
+    create.add_argument("--answer-byte-order", choices=("big", "little"))
+    create.add_argument("--verification-mode", choices=("strict", "evidence", "acceptance"))
+    create.add_argument("--answer-form", choices=ANSWER_FORMS,
+                        help="hash when the task submits a digest of the recovered plaintext")
+    create.add_argument("--answer-hash", choices=tuple(sorted(HASH_ALGORITHMS)),
+                        help="digest algorithm required by --answer-form hash")
+    create.add_argument("--input", action="append", default=[], metavar="ROLE=PATH",
+                        help="upload a local file for crypto tasks; repeat for multiple files")
+    create.add_argument("--number-radix", type=int, choices=(10, 16))
+    create.add_argument("--byte-order", choices=("big", "little"))
+    create.add_argument("--byte-length", type=int)
     create.add_argument("--hint", default="")
     create.add_argument("--objective", default="")
     create.add_argument("--activate", action="store_true")
@@ -27,8 +46,23 @@ def build_parser() -> argparse.ArgumentParser:
     activate = subparsers.add_parser("activate")
     activate.add_argument("project_id", type=int)
 
+    upload = subparsers.add_parser("upload-input")
+    upload.add_argument("project_id", type=int)
+    upload.add_argument("path")
+    upload.add_argument("--role", default="input")
+    upload.add_argument("--input-id")
+    upload.add_argument("--number-radix", type=int, choices=(10, 16))
+    upload.add_argument("--byte-order", choices=("big", "little"))
+    upload.add_argument("--byte-length", type=int)
+
     show = subparsers.add_parser("show")
     show.add_argument("project_id", type=int)
+
+    accept = subparsers.add_parser("accept-candidate")
+    accept.add_argument("project_id", type=int)
+    accept.add_argument("--candidate", type=int, required=True, dest="candidate_fact_id")
+    accept.add_argument("--operator", required=True)
+    accept.add_argument("--note", default="")
 
     list_projects = subparsers.add_parser("list")
     list_projects.set_defaults(command="list")
@@ -64,6 +98,31 @@ def main(argv: list[str] | None = None) -> int:
     client = ProjectClient(args.server_url, auth_token=DispatcherSettings.from_env().server_auth_token)
 
     if args.command == "create-project":
+        goal = {key: value for key, value in {
+            "answer_kind": args.answer_kind, "solution_policy": args.solution_policy,
+            "answer_encoding": args.answer_encoding, "byte_length": args.answer_byte_length,
+            "byte_order": args.answer_byte_order, "verification_mode": args.verification_mode,
+            "answer_form": args.answer_form, "answer_hash": args.answer_hash,
+        }.items() if value is not None}
+        if goal and args.task_type != "crypto":
+            raise ValueError("crypto answer options require --task-type crypto")
+        goal_metadata = {"schema_version": 1, "inputs": [], "goal": crypto_goal(goal)} if args.task_type == "crypto" else {}
+        if args.input and args.task_type != "crypto":
+            raise ValueError("--input requires --task-type crypto")
+        input_specs: list[tuple[str, str]] = []
+        for spec in args.input:
+            role, separator, path = spec.partition("=")
+            if not separator or not role or not path:
+                raise ValueError("--input must use ROLE=PATH")
+            source = Path(path)
+            if not source.is_file():
+                raise ValueError(f"input file does not exist: {source}")
+            if source.stat().st_size > MAX_INPUT_BYTES:
+                raise ValueError("input exceeds 32 MiB limit")
+            safe_input_filename(source.name)
+            input_specs.append((role, path))
+        if args.byte_length is not None and args.byte_length < 0:
+            raise ValueError("--byte-length must be non-negative")
         project = client.create_project(
             args.name,
             project_id=args.project_id,
@@ -71,10 +130,27 @@ def main(argv: list[str] | None = None) -> int:
             target_url=args.target_url,
             hint=args.hint,
             objective=args.objective,
+            task_type=args.task_type,
+            **({"crypto": goal_metadata} if goal_metadata else {}),
         )
+        for role, path in input_specs:
+            client.upload_input_file(
+                project.id, path, role=role, number_radix=args.number_radix,
+                byte_order=args.byte_order, byte_length=args.byte_length,
+            )
+        if input_specs:
+            project = client.get_project(project.id)
         if args.activate:
             project = client.activate_project(project.id)
         _print_json(project.to_dict())
+        return 0
+
+    if args.command == "upload-input":
+        _print_json(client.upload_input_file(
+            args.project_id, args.path, role=args.role, input_id=args.input_id,
+            number_radix=args.number_radix, byte_order=args.byte_order,
+            byte_length=args.byte_length,
+        ))
         return 0
 
     if args.command == "activate":
@@ -83,6 +159,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "show":
         _print_json(client.get_project(args.project_id).to_dict())
+        return 0
+
+    if args.command == "accept-candidate":
+        _print_json(client.accept_crypto_candidate(
+            args.project_id, args.candidate_fact_id, args.operator, note=args.note,
+        ))
         return 0
 
     if args.command == "list":

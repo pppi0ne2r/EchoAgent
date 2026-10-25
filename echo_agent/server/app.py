@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import secrets
+import hashlib
+import re
+import tempfile
 import time
+from datetime import datetime, timezone
+from uuid import uuid4
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
 import uvicorn
+from starlette.requests import Request
 
-from echo_agent.models import Project
+from echo_agent.models import FactKind, Project, ProjectStatus
+from echo_agent.crypto_contract import artifact_ref, input_ref, project_crypto
+from echo_agent.crypto_files import CryptoProjectFiles, MAX_INPUT_BYTES, safe_input_filename
+from echo_agent.crypto_service import CryptoProjectService
+from echo_agent.crypto_verification import VerificationBusy
+from echo_agent.crypto_verify import candidate_digest, goal_sha256
 from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
 from echo_agent.server.schemas import (
+    AcceptanceRequest,
     FactCreateRequest,
     IntentCreateRequest,
     ProjectCreateRequest,
@@ -20,7 +32,7 @@ from echo_agent.server.schemas import (
     ProjectStatusRequest,
 )
 from echo_agent.server.dispatcher_runner import DispatcherRunner
-from echo_agent.storage import ProjectNotFoundError, SQLiteProjectStore
+from echo_agent.storage import ProjectNotFoundError, ProjectConflictError, SQLiteProjectStore
 
 
 class MissingServerDependencyError(RuntimeError):
@@ -39,9 +51,18 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         ) from exc
 
     app = FastAPI(title="EchoAgent Server")
+    @app.exception_handler(ProjectConflictError)
+    async def project_conflict(request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=HTTPStatus.CONFLICT)
     app.state.store = store
-    app.state.project_runtime = DockerProjectRuntime.from_settings()
+    app.state.project_runtime = DockerProjectRuntime.from_settings(
+        project_data_root=store.database_path.parent / "projects"
+    )
     app.state.project_runtime.prepare_shared_resources()
+    app.state.crypto_service = CryptoProjectService(
+        CryptoProjectFiles(store.database_path.parent / "projects"),
+        aes_image=getattr(app.state.project_runtime, "image", None),
+    )
     app.state.dispatcher_runner = DispatcherRunner(store, runtime=app.state.project_runtime)
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -110,6 +131,8 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     @app.post("/projects", status_code=HTTPStatus.CREATED)
     def create_project(data: ProjectCreateRequest) -> dict[str, Any]:
         try:
+            if data.task_type == "crypto" and data.crypto.get("inputs"):
+                raise ValueError("upload crypto input bytes after creating the project")
             project = app.state.store.create_project(
                 name=data.name,
                 project_id=data.id,
@@ -117,6 +140,8 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 target_url=data.target_url,
                 hint=data.hint,
                 objective=data.objective,
+                task_type=data.task_type,
+                crypto=data.crypto,
             )
             return project.to_dict()
         except (KeyError, ValueError) as exc:
@@ -129,82 +154,296 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
 
-    @app.delete("/projects/{project_id}")
-    def delete_project(project_id: int) -> dict[str, Any]:
+    @app.get("/projects/{project_id}/facts/{fact_id}")
+    def get_project_fact(project_id: int, fact_id: int) -> dict[str, Any]:
         try:
-            run_state = app.state.dispatcher_runner.status(project_id)
-            if run_state.running:
-                raise HTTPException(
-                    status_code=HTTPStatus.CONFLICT,
-                    detail="project dispatcher is running; stop it before deleting the project",
-                )
             project = app.state.store.get_project(project_id)
-            app.state.project_runtime.remove_project_container(project)
-            return app.state.store.delete_project(project_id).to_dict()
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
-        except DockerRuntimeError as exc:
+        fact = project.facts.get(fact_id)
+        if fact is None:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="fact not found")
+        return fact.to_dict()
+
+    @app.post("/projects/{project_id}/inputs", status_code=HTTPStatus.CREATED)
+    async def upload_project_input(
+        project_id: int,
+        request: Request,
+        filename: str,
+        role: str = "input",
+        input_id: str | None = None,
+        number_radix: int | None = None,
+        byte_order: str | None = None,
+        byte_length: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            project = app.state.store.get_project(project_id)
+            if project.task_type != "crypto":
+                raise ValueError("inputs can only be uploaded to crypto projects")
+            if project.status.value not in {"inactive", "active", "stoped"}:
+                raise ValueError("inputs can only be added to an inactive, active or stopped crypto project; completed projects are immutable")
+            safe_input_filename(filename)
+            if not role.strip() or len(role) > 64 or any(ord(char) < 32 for char in role):
+                raise ValueError("invalid input role")
+            if input_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", input_id):
+                raise ValueError("invalid input id")
+            ref_id = input_id or f"input-{uuid4().hex}"
+            relative_name = f"inputs/{uuid4().hex}-{filename}"
+            reference: dict[str, Any] = {
+                "id": ref_id, "role": role, "filename": filename,
+                "path": relative_name, "sha256": "0" * 64, "size_bytes": 0,
+            }
+            for key, value in (("number_radix", number_radix), ("byte_order", byte_order), ("byte_length", byte_length)):
+                if value is not None:
+                    reference[key] = value
+            input_ref(reference)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        except ValueError as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
-    @app.put("/projects/{project_id}")
-    def save_project(project_id: int, data: ProjectSaveRequest) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/octet-stream":
+            raise HTTPException(status_code=HTTPStatus.UNSUPPORTED_MEDIA_TYPE, detail="upload raw file bytes as application/octet-stream")
+        if request.headers.get("content-length", "").isdigit() and int(request.headers["content-length"]) > MAX_INPUT_BYTES:
+            raise HTTPException(status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE, detail="input exceeds 32 MiB limit")
+        files = CryptoProjectFiles(store.database_path.parent / "projects")
+        inputs, _ = files.ensure_layout(project_id)
+        final_path = inputs / relative_name.split("/", 1)[1]
+        temporary_path: Path | None = None
+        digest = hashlib.sha256()
+        size = 0
         try:
-            old_project = app.state.store.get_project(project_id)
-            payload = data.model_dump(mode="json")
-            payload["id"] = project_id
-            project = Project.from_dict(payload)
-            apply_project_status_transition(project, old_project)
-            return app.state.store.save_project(project).to_dict()
+            with tempfile.NamedTemporaryFile(mode="wb", prefix=".upload-", dir=inputs.parent, delete=False) as output:
+                temporary_path = Path(output.name)
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > MAX_INPUT_BYTES:
+                        raise HTTPException(status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE, detail="input exceeds 32 MiB limit")
+                    digest.update(chunk)
+                    output.write(chunk)
+            reference["sha256"] = digest.hexdigest()
+            reference["size_bytes"] = size
+            input_ref(reference)
+            temporary_path.replace(final_path)
+            temporary_path = None
+            return app.state.store.add_crypto_input(project_id, reference)
+        except ProjectNotFoundError as exc:
+            final_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        except ValueError as exc:
+            final_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        except Exception:
+            final_path.unlink(missing_ok=True)
+            raise
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @app.post("/projects/{project_id}/artifacts/verify")
+    def verify_crypto_artifact(project_id: int, reference: dict[str, Any]) -> dict[str, bool]:
+        try:
+            project = app.state.store.get_project(project_id)
+            if project.task_type != "crypto":
+                raise ValueError("artifact verification requires a crypto project")
+            CryptoProjectFiles(store.database_path.parent / "projects").verify_ref(
+                project_id, artifact_ref(reference), "artifact"
+            )
+            return {"verified": True}
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
-        except (KeyError, ValueError) as exc:
+        except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
-        except DockerRuntimeError as exc:
+
+    @app.post("/projects/{project_id}/candidates/{candidate_fact_id}/verify")
+    def verify_crypto_candidate(project_id: int, candidate_fact_id: int,
+                                verification_id: str | None = None,
+                                timeout_seconds: float | None = None) -> dict[str, Any]:
+        try:
+            project = app.state.store.get_project(project_id)
+            return app.state.crypto_service.verify(
+                project,
+                candidate_fact_id,
+                verification_id=verification_id,
+                timeout_seconds=timeout_seconds,
+            )
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        except VerificationBusy as exc:
+            raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.post("/projects/{project_id}/verifications/{verification_id}/cancel")
+    def cancel_crypto_verification(project_id: int, verification_id: str) -> dict[str, Any]:
+        try:
+            app.state.store.get_project(project_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        return {"cancelled": app.state.crypto_service.cancel(verification_id)}
+
+    @app.post("/projects/{project_id}/acceptances", status_code=HTTPStatus.CREATED)
+    def record_crypto_acceptance(project_id: int, data: AcceptanceRequest) -> dict[str, Any]:
+        with app.state.store.project_lock(project_id):
+            try:
+                project = app.state.store.get_project(project_id)
+                if project.task_type != "crypto":
+                    raise ValueError("acceptances require a crypto project")
+                if project.status == ProjectStatus.RUNNING:
+                    raise ValueError("stop the project before recording an acceptance")
+                fact = project.facts.get(data.candidate_fact_id)
+                if fact is None or fact.kind != FactKind.CANDIDATE:
+                    raise ValueError("candidate_fact_id must name a candidate fact")
+                candidate = fact.crypto.get("candidate")
+                if (not isinstance(candidate, dict) or not isinstance(candidate.get("answer"), str)
+                        or not candidate["answer"]):
+                    raise ValueError("candidate fact needs a structured answer")
+                record = {
+                    "candidate_fact_id": fact.id,
+                    "candidate_sha256": candidate_digest(fact),
+                    "answer": candidate["answer"],
+                    "goal_sha256": goal_sha256(project),
+                    "accepted_at": datetime.now(timezone.utc).isoformat(),
+                    "operator": data.operator,
+                    "note": data.note,
+                }
+                acceptances = project.crypto.setdefault("acceptances", [])
+                if not any(
+                    item.get("candidate_sha256") == record["candidate_sha256"]
+                    and item.get("answer") == record["answer"]
+                    and item.get("goal_sha256") == record["goal_sha256"]
+                    for item in acceptances
+                ):
+                    acceptances.append(record)
+                project.crypto = project_crypto(project.crypto)
+                app.state.store.save_project(project)
+                return record
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+            except (KeyError, ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.delete("/projects/{project_id}")
+    def delete_project(project_id: int) -> dict[str, Any]:
+        with app.state.store.project_lock(project_id):
+            try:
+                run_state = app.state.dispatcher_runner.status(project_id)
+                if run_state.running:
+                    raise HTTPException(
+                        status_code=HTTPStatus.CONFLICT,
+                        detail="project dispatcher is running; stop it before deleting the project",
+                    )
+                project = app.state.store.get_project(project_id)
+                if project.status.value == "running":
+                    raise ProjectConflictError("stop the project before deleting it")
+                app.state.project_runtime.remove_project_container(project)
+                return app.state.store.delete_project(project_id).to_dict()
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+            except DockerRuntimeError as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.put("/projects/{project_id}")
+    def save_project(project_id: int, data: ProjectSaveRequest, request: Request) -> dict[str, Any]:
+        with app.state.store.project_lock(project_id):
+            try:
+                old_project = app.state.store.get_project(project_id)
+                if old_project.task_type == "crypto":
+                    if not {"task_type", "crypto"}.issubset(data.model_fields_set):
+                        raise ValueError("crypto project save requires task_type and crypto metadata")
+                    for field_name, old_items in (("facts", old_project.facts), ("intents", old_project.intents)):
+                        for item in getattr(data, field_name):
+                            old_item = old_items.get(item.get("id"))
+                            if old_item is not None and old_item.crypto and "crypto" not in item:
+                                raise ValueError(f"crypto metadata missing for {field_name} id {old_item.id}")
+                payload = data.model_dump(mode="json")
+                if old_project.task_type == "crypto" and isinstance(payload.get("crypto"), dict):
+                    # Receipts are server-owned: a normal project save cannot add or remove them.
+                    payload["crypto"].pop("acceptances", None)
+                    preserved = old_project.crypto.get("acceptances")
+                    if preserved:
+                        payload["crypto"]["acceptances"] = preserved
+                payload["id"] = project_id
+                project = Project.from_dict(payload)
+                dispatcher_id = request.headers.get("x-echo-agent-dispatcher")
+                app.state.store.check_write(project, dispatcher_id=dispatcher_id)
+                app.state.crypto_service.validate_save(old_project, project)
+                apply_project_status_transition(project, old_project)
+                return app.state.store.save_project(project, dispatcher_id=dispatcher_id).to_dict()
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+            except VerificationBusy as exc:
+                raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(exc)) from exc
+            except (KeyError, ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+            except DockerRuntimeError as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
     @app.patch("/projects/{project_id}/status")
     def update_project_status(project_id: int, data: ProjectStatusRequest) -> dict[str, Any]:
+        # Joining while holding project_lock would block the dispatcher's final save.
         try:
-            project = app.state.store.get_project(project_id)
-            old_project = Project.from_dict(project.to_dict())
-            project.transition_to(data.status)
-            apply_project_status_transition(project, old_project)
-            return app.state.store.save_project(project).to_dict()
+            if ProjectStatus.coerce(data.status) == ProjectStatus.STOPED:
+                project = app.state.store.get_project(project_id)
+                if project.status != ProjectStatus.STOPED:
+                    project.transition_to(ProjectStatus.STOPED)
+                app.state.dispatcher_runner.stop(project_id)
+                return app.state.store.get_project(project_id).to_dict()
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
-        except ValueError as exc:
+        except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
-        except DockerRuntimeError as exc:
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        with app.state.store.project_lock(project_id):
+            try:
+                project = app.state.store.get_project(project_id)
+                old_project = Project.from_dict(project.to_dict())
+                project.transition_to(data.status)
+                app.state.store.check_write(project, force_stop=project.status.value == "stoped")
+                app.state.crypto_service.validate_save(old_project, project)
+                apply_project_status_transition(project, old_project)
+                return app.state.store.save_project(project, force_stop=project.status.value == "stoped").to_dict()
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+            except VerificationBusy as exc:
+                raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(exc)) from exc
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+            except DockerRuntimeError as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
     @app.post("/projects/{project_id}/facts", status_code=HTTPStatus.CREATED)
     def add_fact(project_id: int, data: FactCreateRequest) -> dict[str, Any]:
-        try:
-            project = app.state.store.get_project(project_id)
-            fact = project.add_fact(data.description, fact_id=data.id)
-            app.state.store.save_project(project)
-            return fact.to_dict()
-        except ProjectNotFoundError as exc:
-            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        with app.state.store.project_lock(project_id):
+            try:
+                project = app.state.store.get_project(project_id)
+                app.state.store.check_write(project)
+                fact = project.add_fact(data.description, fact_id=data.id, crypto=data.crypto)
+                app.state.store.save_project(project)
+                return fact.to_dict()
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
     @app.post("/projects/{project_id}/intents", status_code=HTTPStatus.CREATED)
     def add_intent(project_id: int, data: IntentCreateRequest) -> dict[str, Any]:
-        try:
-            project = app.state.store.get_project(project_id)
-            intent = project.add_intent(
-                description=data.description,
-                from_fact_id=data.from_fact_id,
-                to_fact_id=data.to_fact_id,
-                intent_id=data.id,
-            )
-            app.state.store.save_project(project)
-            return intent.to_dict()
-        except ProjectNotFoundError as exc:
-            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        with app.state.store.project_lock(project_id):
+            try:
+                project = app.state.store.get_project(project_id)
+                app.state.store.check_write(project)
+                intent = project.add_intent(
+                    description=data.description,
+                    from_fact_id=data.from_fact_id,
+                    to_fact_id=data.to_fact_id,
+                    intent_id=data.id,
+                    crypto=data.crypto,
+                )
+                app.state.store.save_project(project)
+                return intent.to_dict()
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
     @app.get("/projects/{project_id}/logs")
     def list_project_logs(project_id: int, limit: int = 200) -> list[dict[str, Any]]:

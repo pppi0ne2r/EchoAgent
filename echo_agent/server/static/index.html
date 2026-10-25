@@ -21,9 +21,63 @@
           <h2>创建项目</h2>
           <form id="create-project-form" class="project-form">
             <label>
+              任务类型
+              <select name="task_type" id="create-task-type">
+                <option value="general">Web / 渗透</option>
+                <option value="crypto">密码学（离线）</option>
+              </select>
+            </label>
+            <label id="target-url-field">
               目标 URL
               <input name="target_url" type="url" placeholder="https://target.example" required />
             </label>
+            <div id="crypto-files-field" class="crypto-files-field" hidden>
+              <label>密码题完成目标
+                <select name="answer_kind">
+                  <option value="plaintext">恢复明文 / flag</option>
+                  <option value="factors">求 RSA 因子</option>
+                  <option value="private_exponent">求 RSA 私钥指数</option>
+                </select>
+              </label>
+              <label>解的要求
+                <select name="solution_policy"><option value="unique">需要唯一解</option><option value="any">任意一个有效解即可</option></select>
+              </label>
+              <label>最终答案表示
+                <select name="answer_encoding"><option value="">默认（RSA 十进制 / AES UTF-8）</option><option value="decimal">十进制</option><option value="utf8">UTF-8 文本 / flag</option><option value="hex">十六进制字节</option></select>
+              </label>
+              <label>答案形态
+                <select name="answer_form"><option value="">明文/原样（题面直接要 flag 或明文）</option><option value="hash">哈希（题面要明文的 md5/sha1/sha256 等）</option></select>
+              </label>
+              <label>哈希算法（答案形态为哈希时必填）
+                <select name="answer_hash"><option value="">未指定</option><option value="md5">md5</option><option value="sha1">sha1</option><option value="sha224">sha224</option><option value="sha256">sha256</option><option value="sha384">sha384</option><option value="sha512">sha512</option><option value="sha3_256">sha3_256</option><option value="sha3_512">sha3_512</option><option value="blake2b">blake2b</option><option value="blake2s">blake2s</option></select>
+              </label>
+              <label>最终明文字节数（需要保留前导零时填写）
+                <input name="answer_byte_length" type="number" min="1" max="4096" step="1" placeholder="未指定" />
+              </label>
+              <label>RSA 明文字节序
+                <select name="answer_byte_order"><option value="">默认大端</option><option value="big">大端</option><option value="little">小端</option></select>
+              </label>
+              <label>输入文件（可多选，单文件上限 32 MiB）
+                <input name="input_files" type="file" multiple />
+              </label>
+              <label>文件角色
+                <select name="input_role">
+                  <option value="input">原始输入</option>
+                  <option value="source">源码</option>
+                  <option value="parameters">参数</option>
+                  <option value="ciphertext">密文</option>
+                </select>
+              </label>
+              <label>数值基数（如适用）
+                <select name="number_radix"><option value="">未指定</option><option value="10">十进制</option><option value="16">十六进制</option></select>
+              </label>
+              <label>字节顺序（如适用）
+                <select name="byte_order"><option value="">未指定</option><option value="big">大端</option><option value="little">小端</option></select>
+              </label>
+              <label>字节长度（如适用）
+                <input name="byte_length" type="number" min="0" step="1" placeholder="未指定" />
+              </label>
+            </div>
             <label>
               Hint
               <textarea name="hint" rows="3" placeholder="题目提示、范围或账号信息"></textarea>
@@ -66,6 +120,33 @@
           <div><span>图</span><strong>-</strong></div>
           <div><span>Docker</span><strong>-</strong></div>
           <div><span>调度</span><strong>-</strong></div>
+        </div>
+        <div id="crypto-inputs" class="crypto-inputs" hidden>
+          <strong id="crypto-input-title">输入清单</strong>
+          <div id="crypto-input-list"></div>
+          <form id="upload-input-form" class="project-form">
+            <label>补充输入文件
+              <input name="file" type="file" required />
+            </label>
+            <label>文件角色
+              <select name="role"><option value="input">原始输入</option><option value="source">源码</option><option value="parameters">参数</option><option value="ciphertext">密文</option></select>
+            </label>
+            <label>数值基数（如适用）
+              <select name="number_radix"><option value="">未指定</option><option value="10">十进制</option><option value="16">十六进制</option></select>
+            </label>
+            <label>字节顺序（如适用）
+              <select name="byte_order"><option value="">未指定</option><option value="big">大端</option><option value="little">小端</option></select>
+            </label>
+            <label>字节长度（如适用）
+              <input name="byte_length" type="number" min="0" step="1" placeholder="未指定" />
+            </label>
+            <button type="submit">上传到当前密码项目</button>
+          </form>
+        </div>
+
+        <div id="crypto-candidates" class="crypto-inputs crypto-candidates" hidden>
+          <strong id="crypto-candidate-title">候选与验证</strong>
+          <div id="crypto-candidate-list"></div>
         </div>
 
         <div class="graph-shell">

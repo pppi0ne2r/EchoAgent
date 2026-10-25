@@ -16,6 +16,16 @@ const els = {
   status: document.querySelector("#connection-status"),
   projectList: document.querySelector("#project-list"),
   form: document.querySelector("#create-project-form"),
+  taskType: document.querySelector("#create-task-type"),
+  targetUrlField: document.querySelector("#target-url-field"),
+  cryptoFilesField: document.querySelector("#crypto-files-field"),
+  cryptoInputs: document.querySelector("#crypto-inputs"),
+  cryptoInputTitle: document.querySelector("#crypto-input-title"),
+  cryptoInputList: document.querySelector("#crypto-input-list"),
+  cryptoCandidates: document.querySelector("#crypto-candidates"),
+  cryptoCandidateTitle: document.querySelector("#crypto-candidate-title"),
+  cryptoCandidateList: document.querySelector("#crypto-candidate-list"),
+  uploadForm: document.querySelector("#upload-input-form"),
   refreshProjects: document.querySelector("#refresh-projects"),
   refreshCurrent: document.querySelector("#refresh-current"),
   refreshLogs: document.querySelector("#refresh-logs"),
@@ -131,6 +141,18 @@ function renderCurrentProject() {
   }
   els.title.textContent = project.name;
   els.subtitle.textContent = `#${project.id} · ${project.objective || "No objective"}`;
+  if (project.task_type === "crypto") {
+    const inputs = project.crypto?.inputs || [];
+    els.cryptoInputs.hidden = false;
+    els.cryptoInputTitle.textContent = `输入清单 · ${inputs.length} 个文件`;
+    els.cryptoInputList.innerHTML = inputs.length ? inputs.map((input) => `<div><code>${escapeHtml(input.id)}</code> · ${escapeHtml(input.role)} · ${escapeHtml(input.filename || input.path)} · ${input.size_bytes} B · SHA-256 <code>${escapeHtml(input.sha256)}</code></div>`).join("") : "<div>暂无上传文件</div>";
+    renderCryptoCandidates(project);
+  } else {
+    els.cryptoInputs.hidden = true;
+    els.cryptoInputList.innerHTML = "";
+    els.cryptoCandidates.hidden = true;
+    els.cryptoCandidateList.innerHTML = "";
+  }
   const values = [
     project.status,
     project.target_url || "-",
@@ -146,6 +168,84 @@ function renderCurrentProject() {
   renderGraphDetail(project);
 }
 
+function hexToDisplayText(hex) {
+  if (typeof hex !== "string" || !hex || hex.length % 2 || !/^[0-9a-f]+$/i.test(hex)) return null;
+  try {
+    const bytes = new Uint8Array(hex.match(/.{2}/g).map((pair) => parseInt(pair, 16)));
+    const text = new TextDecoder().decode(bytes);
+    if (!text || text.includes("\ufffd")) return null;
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+function candidateBadge(verification, acceptance) {
+  if (acceptance) return { text: "平台已接受", className: "ok" };
+  if (!verification) return { text: "未验证", className: "pending" };
+  if (verification.status === "pass") return { text: "验证通过", className: "ok" };
+  if (verification.status === "fail") return { text: "验证失败", className: "bad" };
+  return { text: "无法验证", className: "pending" };
+}
+
+function renderCryptoCandidates(project) {
+  const crypto = project.crypto || {};
+  const goal = crypto.goal || {};
+  const candidates = (project.facts || []).filter((fact) => fact.kind === "candidate");
+  els.cryptoCandidates.hidden = false;
+  els.cryptoCandidateTitle.textContent = `候选与验证 · ${candidates.length} 个候选`;
+  const goalParts = [
+    `answer_kind=${goal.answer_kind || "plaintext"}`,
+    `answer_form=${goal.answer_form || "literal"}`,
+  ];
+  if (goal.answer_form === "hash" && goal.answer_hash) goalParts.push(`hash=${goal.answer_hash}`);
+  goalParts.push(`verification=${goal.verification_mode || "strict"}`);
+  goalParts.push(`solution=${goal.solution_policy || "unique"}`);
+  const goalLine = `<div class="candidate-goal">完成目标：<code>${escapeHtml(goalParts.join(" · "))}</code></div>`;
+  if (!candidates.length) {
+    els.cryptoCandidateList.innerHTML = `${goalLine}<div>暂无候选</div>`;
+    return;
+  }
+  const verifications = crypto.verifications || [];
+  const acceptances = crypto.acceptances || [];
+  const rows = candidates.map((fact) => {
+    const candidate = fact.crypto?.candidate || {};
+    const verification = [...verifications].reverse().find((item) => item.candidate_fact_id === fact.id);
+    const acceptance = [...acceptances].reverse().find((item) => item.candidate_fact_id === fact.id);
+    const checks = verification?.checks || {};
+    const badge = candidateBadge(verification, acceptance);
+    const details = [];
+    if (candidate.scheme) details.push(`scheme=${candidate.scheme}`);
+    if (candidate.answer_kind) details.push(`answer_kind=${candidate.answer_kind}`);
+    if (candidate.m) details.push(`m=${trimText(candidate.m, 80)}`);
+    if (verification?.status) details.push(`验证=${verification.status}${verification.method ? ` (${verification.method})` : ""}`);
+    if (verification?.backend) details.push(`后端=${verification.backend}`);
+    if (typeof verification?.elapsed_ms === "number") details.push(`耗时=${verification.elapsed_ms}ms`);
+    if (verification?.terminated_reason && verification.terminated_reason !== "completed") {
+      details.push(`终止=${verification.terminated_reason}`);
+    }
+    if (acceptance?.operator) details.push(`回执=${acceptance.operator}${acceptance.accepted_at ? ` @ ${acceptance.accepted_at}` : ""}`);
+    const preimageText = hexToDisplayText(checks.preimage_hex);
+    const preimageLine = checks.preimage_hex
+      ? `<div>恢复出的明文：${preimageText !== null ? `<code>${escapeHtml(trimText(preimageText, 200))}</code> ` : ""}<code>${escapeHtml(trimText(checks.preimage_hex, 200))}</code></div>`
+      : "";
+    const expectedLine = checks.answer_hash_expected
+      ? `<div>期望哈希（${escapeHtml(checks.answer_hash_algorithm || "")}）：<code>${escapeHtml(checks.answer_hash_expected)}</code></div>`
+      : "";
+    const reasonLine = checks.reason
+      ? `<div>验证说明：<code>${escapeHtml(trimText(checks.reason, 300))}</code></div>`
+      : "";
+    return `<div class="candidate-row">
+      <div><strong>#${fact.id}</strong> <span class="candidate-badge ${badge.className}">${escapeHtml(badge.text)}</span> answer=<code>${escapeHtml(trimText(candidate.answer ?? "", 200))}</code></div>
+      ${details.length ? `<div class="candidate-meta">${escapeHtml(details.join(" · "))}</div>` : ""}
+      ${preimageLine}${expectedLine}${reasonLine}
+      <div class="candidate-desc">${escapeHtml(trimText(fact.description || "", 300))}</div>
+    </div>`;
+  });
+  els.cryptoCandidateList.innerHTML = goalLine + rows.join("");
+}
+
 function updateActionButtons() {
   const project = state.currentProject;
   const hasProject = Boolean(project);
@@ -159,6 +259,7 @@ function updateActionButtons() {
   els.runProject.disabled = !hasProject || state.busy || !canRun;
   els.stopProject.disabled = !hasProject || state.busy || !canStop;
   els.deleteProject.disabled = !hasProject || state.busy || canStop;
+  els.uploadForm.querySelector('button[type="submit"]').disabled = !hasProject || state.busy || project.task_type !== "crypto" || canStop || project.status === "completed";
 }
 
 async function loadLogs() {
@@ -885,6 +986,10 @@ function clearCurrentProject() {
     node.textContent = "-";
   });
   els.graph.innerHTML = "";
+  els.cryptoInputs.hidden = true;
+  els.cryptoInputList.innerHTML = "";
+  els.cryptoCandidates.hidden = true;
+  els.cryptoCandidateList.innerHTML = "";
   if (els.graphDetail) {
     els.graphDetail.className = "graph-detail empty-detail";
     els.graphDetail.textContent = "点击 fact 节点或 intent 边查看详情";
@@ -941,22 +1046,83 @@ function trimText(value, length) {
   return text.length > length ? `${text.slice(0, length - 1)}...` : text;
 }
 
+function updateCreateTaskType() {
+  const crypto = els.taskType.value === "crypto";
+  els.targetUrlField.hidden = crypto;
+  els.cryptoFilesField.hidden = !crypto;
+  els.targetUrlField.querySelector("input").required = !crypto;
+}
+
+els.taskType.addEventListener("change", updateCreateTaskType);
+updateCreateTaskType();
+
+async function uploadBrowserFile(projectId, file, role, data) {
+  if (file.size > 32 * 1024 * 1024) throw new Error("单个输入文件不能超过 32 MiB");
+  const query = new URLSearchParams({ filename: file.name, role });
+  for (const key of ["number_radix", "byte_order", "byte_length"]) {
+    if (data.get(key) !== "") query.set(key, data.get(key));
+  }
+  const reference = await api(`/projects/${projectId}/inputs?${query}`, {
+    method: "POST", body: file, headers: { "Content-Type": "application/octet-stream" },
+  });
+  if (reference.size_bytes !== file.size) throw new Error(`上传大小不匹配：${file.name}`);
+  return reference;
+}
+
 els.form.addEventListener("submit", async (event) => {
   event.preventDefault();
   await withAction("creating project...", async () => {
     const data = new FormData(els.form);
+    const crypto = data.get("task_type") === "crypto";
+    const files = crypto ? [...els.form.querySelector('input[name="input_files"]').files] : [];
+    if (files.some((file) => file.size > 32 * 1024 * 1024)) {
+      throw new Error("单个输入文件不能超过 32 MiB");
+    }
     const payload = {
-      target_url: data.get("target_url"),
+      target_url: crypto ? null : data.get("target_url"),
       hint: data.get("hint") || "",
       objective: data.get("objective"),
+      task_type: crypto ? "crypto" : "general",
     };
+    if (crypto) {
+      const goal = { answer_kind: data.get("answer_kind"), solution_policy: data.get("solution_policy") };
+      if (data.get("answer_encoding")) goal.answer_encoding = data.get("answer_encoding");
+      if (data.get("answer_byte_length")) goal.byte_length = Number(data.get("answer_byte_length"));
+      if (data.get("answer_byte_order")) goal.byte_order = data.get("answer_byte_order");
+      if (data.get("answer_form")) {
+        goal.answer_form = data.get("answer_form");
+        if (goal.answer_form === "hash") {
+          if (!data.get("answer_hash")) throw new Error("答案形态为哈希时必须选择哈希算法");
+          goal.answer_hash = data.get("answer_hash");
+          // 摘要本身就是答案文本；契约只接受 utf8，避免与明文编码混淆
+          goal.answer_encoding = "utf8";
+        }
+      }
+      payload.crypto = { schema_version: 1, inputs: [], goal };
+    }
     const project = await api("/projects", {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    els.form.reset();
     await refreshProjectsOnly();
     await selectProject(project.id);
+    for (const file of files) {
+      await uploadBrowserFile(project.id, file, data.get("input_role") || "input", data);
+    }
+    await refreshCurrent();
+    els.form.reset();
+    updateCreateTaskType();
+  });
+});
+
+els.uploadForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.currentProjectId || state.currentProject?.task_type !== "crypto") return;
+  await withAction("uploading crypto input...", async () => {
+    const data = new FormData(els.uploadForm);
+    await uploadBrowserFile(state.currentProjectId, data.get("file"), data.get("role") || "input", data);
+    els.uploadForm.reset();
+    await refreshCurrent();
   });
 });
 

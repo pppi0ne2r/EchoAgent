@@ -11,6 +11,7 @@ import time
 from collections import deque
 from typing import Mapping, Sequence
 
+from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, CryptoBudget, resolve_crypto_budget
 from echo_agent.dispatcher.parsing import (
     ReasonFormatError,
     extract_mode_json_output,
@@ -43,6 +44,41 @@ TRANSIENT_UPSTREAM_MARKERS = (
     "bad gateway",
     "gateway timeout",
 )
+
+# Quota and credential failures cannot be fixed by retrying: every attempt fails the same way
+# and the upstream error often has no mode JSON, so salvage would pick up the prompt echo.
+# These are checked *before* salvage and transient classification.  Only unambiguous billing
+# phrases are listed: a bare "401"/"403" also appears in target HTTP responses the worker may
+# legitimately observe while solving, so it must not stop the dispatcher.
+FATAL_UPSTREAM_MARKERS = (
+    "insufficient_balance",
+    "insufficient balance",
+    "insufficient account balance",
+    "payment required",
+    "余额不足",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+)
+
+
+def fatal_upstream_marker(text: str) -> str | None:
+    """Return the matched quota/credential marker, or None for ordinary failures."""
+    lowered = (text or "").lower()
+    for marker in FATAL_UPSTREAM_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+class UpstreamFatalError(RuntimeError):
+    """An upstream quota/auth failure that retrying cannot fix."""
+
+
+class CryptoExecutionLimit(RuntimeError):
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class CodexDockerAgent:
@@ -99,6 +135,8 @@ class CodexDockerAgent:
         self._process_lock = threading.Lock()
         self._processes: list[subprocess.Popen[str]] = []
         self._run_state = threading.local()
+        self._crypto_containers: set[str] = set()
+        self._cancelled_containers: set[str] = set()
 
     def run(
         self,
@@ -113,36 +151,70 @@ class CodexDockerAgent:
             raise RuntimeError("project.docker is required to run codex in explore/reason mode")
 
         runtime_key = self._runtime_key(intent_id=intent_id, runtime_key=runtime_key)
-        self._run_preflight(project, log=log)
-        if runtime_key is not None:
-            self._prepare_runtime(project, runtime_key, log=log)
-        command = self._docker_command(project, mode, runtime_key=runtime_key)
-        env = self._subprocess_env()
-        workspace = self.workspace if runtime_key is None else self.runtime_paths(runtime_key)[1]
-        self._log(
-            log,
-            f"codex agent process starting in {mode.value} mode",
-            metadata={
-                "docker": project.docker,
-                "workspace": workspace,
-                "intent_id": intent_id,
-                "runtime_key": runtime_key,
-                "command": self._safe_command(command),
-                "model": self.mode_models.get(mode.value, self.model),
-                "timeout_seconds": self._timeout_for_mode(mode),
-                "no_output_timeout_seconds": self._no_output_timeout_for_mode(mode),
-                "prompt_chars": len(prompt),
-            },
+        crypto_worker = project.task_type == "crypto" and intent_id is not None
+        self._run_state.crypto_budget = (
+            resolve_crypto_budget(project.crypto.get("default_budget"), project.intents[intent_id].crypto.get("budget"))
+            if crypto_worker else None
         )
-        output = self._run_process(command, prompt, mode, env=env, log=log)
-        self._log(log, f"codex agent process finished in {mode.value} mode", metadata={"output_chars": len(output)})
-        state = self._run_state
-        return AgentRunResult(
-            output=output,
-            salvaged=bool(getattr(state, "salvaged", False)),
-            timed_out=bool(getattr(state, "timed_out", False)),
-            raw_output=str(getattr(state, "raw_output", "") or output),
-        )
+        self._run_state.limit_reason = None
+        if crypto_worker:
+            with self._process_lock:
+                self._crypto_containers.add(project.docker)
+        try:
+            if crypto_worker:
+                self._set_crypto_memory_limit(project.docker, self._run_state.crypto_budget)
+            self._run_preflight(project, log=log)
+            if runtime_key is not None:
+                self._prepare_runtime(project, runtime_key, log=log)
+            command = self._docker_command(project, mode, runtime_key=runtime_key)
+            env = self._subprocess_env()
+            workspace = self.workspace if runtime_key is None else self.runtime_paths(runtime_key)[1]
+            self._log(
+                log,
+                f"codex agent process starting in {mode.value} mode",
+                metadata={
+                    "docker": project.docker,
+                    "workspace": workspace,
+                    "intent_id": intent_id,
+                    "runtime_key": runtime_key,
+                    "command": self._safe_command(command),
+                    "model": self.mode_models.get(mode.value, self.model),
+                    "timeout_seconds": self._timeout_for_mode(mode),
+                    "no_output_timeout_seconds": self._no_output_timeout_for_mode(mode),
+                    "prompt_chars": len(prompt),
+                },
+            )
+            output = self._run_process(command, prompt, mode, env=env, log=log)
+            self._log(log, f"codex agent process finished in {mode.value} mode", metadata={"output_chars": len(output)})
+            state = self._run_state
+            return AgentRunResult(
+                output=output,
+                salvaged=bool(getattr(state, "salvaged", False)),
+                timed_out=bool(getattr(state, "timed_out", False)),
+                raw_output=str(getattr(state, "raw_output", "") or output),
+                limit_reason=getattr(state, "limit_reason", None),
+            )
+        finally:
+            try:
+                if crypto_worker:
+                    with self._process_lock:
+                        cancelled = project.docker in self._cancelled_containers
+                        self._crypto_containers.discard(project.docker)
+                        self._cancelled_containers.discard(project.docker)
+                    if not cancelled:
+                        try:
+                            self._reset_crypto_container(project.docker)
+                        except Exception as exc:
+                            # Cleanup must never replace an already computed result or a real
+                            # CryptoExecutionLimit; report it and let the original outcome stand.
+                            self._log(
+                                log,
+                                "crypto container reset failed after run",
+                                "warning",
+                                {"docker": project.docker, "error": self._truncate(str(exc), 1000)},
+                            )
+            finally:
+                self._run_state.crypto_budget = None
 
     def intent_runtime_paths(self, intent_id: int) -> tuple[str, str]:
         return self.runtime_paths(f"intents/{intent_id}")
@@ -186,7 +258,36 @@ class CodexDockerAgent:
                     f"TMUX_TMPDIR={codex_home}/tmux",
                 ]
             )
-        command.extend(["-w", workspace, project.docker, *self._codex_command_for_mode(mode)])
+        codex_command = list(self._codex_command_for_mode(mode))
+        if getattr(project, "task_type", "general") == "crypto" and mode == DispatchMode.REASON:
+            # Codex 0.118.0 supports these feature gates. A read-only sandbox
+            # alone still permits commands; disable both shell implementations
+            # and delegation for the crypto planner, without restricting workers.
+            cleaned_command: list[str] = []
+            arguments = iter(codex_command)
+            for argument in arguments:
+                if argument in {"--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto"}:
+                    continue
+                if argument in {"--sandbox", "-s"}:
+                    next(arguments, None)
+                    continue
+                if argument.startswith("--sandbox="):
+                    continue
+                cleaned_command.append(argument)
+            codex_command = cleaned_command
+            restrictions = [
+                "--sandbox", "read-only",
+                "-c", "features.shell_tool=false",
+                "-c", "features.unified_exec=false",
+                "-c", "features.multi_agent=false",
+                "-c", "features.apps=false",
+                "-c", 'web_search="disabled"',
+            ]
+            if codex_command and codex_command[-1] == "-":
+                codex_command[-1:-1] = restrictions
+            else:
+                codex_command.extend(restrictions)
+        command.extend(["-w", workspace, project.docker, *codex_command])
         return command
 
     def _prepare_runtime(
@@ -338,6 +439,9 @@ class CodexDockerAgent:
         stderr_log_lines: list[str] = []
         output_lock = threading.Lock()
         total_activity_count = 0
+        output_bytes_seen = 0
+        max_output_bytes = getattr(getattr(self._run_state, "crypto_budget", None), "output_bytes", None)
+        output_limit_hit = threading.Event()
 
         def pop_log_block(lines: list[str]) -> str | None:
             if not lines:
@@ -358,40 +462,45 @@ class CodexDockerAgent:
             if stderr_block:
                 self._log(log, f"codex output:\n{self._truncate(stderr_block, limit=5000)}")
 
-        def read_stdout() -> None:
-            nonlocal total_activity_count
-            for raw_line in process.stdout:
-                line = raw_line.rstrip("\n")
+        def read_stream(stream, name: str) -> None:
+            nonlocal total_activity_count, output_bytes_seen
+            pending = ""
+            values = output_lines if name == "stdout" else stderr_lines
+            log_values = stdout_log_lines if name == "stdout" else stderr_log_lines
+            while True:
+                # readline(size) bounds a single unbroken line before it reaches memory.
+                chunk = stream.readline(4096)
+                if not chunk:
+                    break
+                with output_lock:
+                    output_bytes_seen += len(chunk.encode("utf-8", errors="replace"))
+                    if max_output_bytes is not None and output_bytes_seen > max_output_bytes:
+                        output_limit_hit.set()
+                        continue
+                pending += chunk
+                if not chunk.endswith("\n") and len(chunk) == 4096:
+                    continue
+                line = pending.rstrip("\n")
+                pending = ""
                 if not line:
                     continue
-                flush_needed = False
                 with output_lock:
                     total_activity_count += 1
-                    output_lines.append(line)
-                    recent_output.append(f"stdout: {line}")
-                    stdout_log_lines.append(line)
-                    flush_needed = should_flush_log_block(stdout_log_lines)
+                    values.append(line)
+                    recent_output.append(f"{name}: {line}")
+                    log_values.append(line)
+                    flush_needed = should_flush_log_block(log_values)
                 if flush_needed:
                     flush_log_blocks()
-
-        def read_stderr() -> None:
-            nonlocal total_activity_count
-            for raw_line in process.stderr:
-                line = raw_line.rstrip("\n")
-                if not line:
-                    continue
-                flush_needed = False
+            if pending and not output_limit_hit.is_set():
                 with output_lock:
                     total_activity_count += 1
-                    stderr_lines.append(line)
-                    recent_output.append(f"stderr: {line}")
-                    stderr_log_lines.append(line)
-                    flush_needed = should_flush_log_block(stderr_log_lines)
-                if flush_needed:
-                    flush_log_blocks()
+                    values.append(pending)
+                    recent_output.append(f"{name}: {pending}")
+                    log_values.append(pending)
 
-        stdout_reader = threading.Thread(target=read_stdout, daemon=True)
-        stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+        stdout_reader = threading.Thread(target=read_stream, args=(process.stdout, "stdout"), daemon=True)
+        stderr_reader = threading.Thread(target=read_stream, args=(process.stderr, "stderr"), daemon=True)
         stdout_reader.start()
         stderr_reader.start()
         started_at = time.monotonic()
@@ -403,6 +512,22 @@ class CodexDockerAgent:
         no_output_timeout_seconds = self._no_output_timeout_for_mode(mode)
         timeout_seconds = self._timeout_for_mode(mode)
         while process.poll() is None:
+            if output_limit_hit.is_set():
+                self._kill_process(process)
+                process.wait()
+                stdout_reader.join(timeout=1)
+                stderr_reader.join(timeout=1)
+                flush_log_blocks()
+                process.stdout.close()
+                process.stderr.close()
+                with output_lock:
+                    combined = "\n".join(part for part in ("\n".join(output_lines), "\n".join(stderr_lines)) if part).strip()
+                salvaged = self._salvaged_output(combined, mode)
+                if salvaged is not None:
+                    self._remember_run(salvaged=True, timed_out=False, raw_output=combined,
+                                       limit_reason="budget_exhausted")
+                    return salvaged
+                raise CryptoExecutionLimit("budget_exhausted", "crypto output limit exceeded")
             elapsed = time.monotonic() - started_at
             with output_lock:
                 current_activity_count = total_activity_count
@@ -437,10 +562,12 @@ class CodexDockerAgent:
                     "error",
                     {"timeout_seconds": timeout_seconds, "output_lines": output_count, "recent_output": detail},
                 )
-                raise RuntimeError(self._timeout_message(
+                error = CryptoExecutionLimit if max_output_bytes is not None else RuntimeError
+                message = self._timeout_message(
                     f"codex agent timed out in {mode.value} mode after {timeout_seconds}s",
                     detail or combined,
-                ))
+                )
+                raise error("timeout", message) if error is CryptoExecutionLimit else error(message)
             idle_seconds = time.monotonic() - last_activity_at
             if no_output_timeout_seconds > 0 and idle_seconds > no_output_timeout_seconds:
                 self._kill_process(process)
@@ -530,8 +657,43 @@ class CodexDockerAgent:
             output = "\n".join(output_lines).strip()
             stderr_output = "\n".join(stderr_lines).strip()
             detail = "\n".join(recent_output).strip()
+        if output_limit_hit.is_set():
+            combined = "\n".join(item for item in (output, stderr_output) if item)
+            salvaged_output = self._salvaged_output(combined, mode)
+            if salvaged_output is not None:
+                self._remember_run(salvaged=True, timed_out=False, raw_output=combined,
+                                   limit_reason="budget_exhausted")
+                return salvaged_output
+            raise CryptoExecutionLimit("budget_exhausted", "crypto output limit exceeded")
         if return_code != 0:
+            if max_output_bytes is not None and return_code in {137, -9}:
+                combined = "\n".join(item for item in (output, stderr_output) if item)
+                salvaged_output = self._salvaged_output(combined, mode)
+                if salvaged_output is not None:
+                    self._remember_run(salvaged=True, timed_out=False, raw_output=combined,
+                                       limit_reason="budget_exhausted")
+                    return salvaged_output
+                raise CryptoExecutionLimit("budget_exhausted", "crypto container process was killed by its memory or process limit")
             combined = "\n".join(item for item in [output, stderr_output] if item)
+            # Prefer the process' own error stream: stdout also carries the model's answer text
+            # and the prompt echo, where a phrase like "insufficient balance" may legitimately
+            # appear as an observation.  Only fall back to stdout when stderr is empty.
+            marker = fatal_upstream_marker(stderr_output)
+            if marker is None and not stderr_output.strip():
+                marker = fatal_upstream_marker(output)
+            if marker is not None:
+                self._log(
+                    log,
+                    f"codex upstream quota/auth failure in {mode.value} mode "
+                    f"(matched {marker!r}, exit code {return_code}); retrying cannot fix it",
+                    "error",
+                    {"recent_output": self._upstream_excerpt(combined)},
+                )
+                raise UpstreamFatalError(
+                    f"codex upstream quota/auth failure in {mode.value} mode: matched {marker!r}; "
+                    f"check the provider balance or API key. "
+                    f"{self._upstream_excerpt(combined)}"
+                )
             salvaged_output = self._salvaged_output(combined, mode)
             if salvaged_output is not None:
                 self._log(
@@ -564,10 +726,18 @@ class CodexDockerAgent:
         self._remember_run(salvaged=False, timed_out=False, raw_output=output)
         return output
 
-    def _remember_run(self, *, salvaged: bool, timed_out: bool, raw_output: str) -> None:
+    def _remember_run(self, *, salvaged: bool, timed_out: bool, raw_output: str,
+                      limit_reason: str | None = None) -> None:
         self._run_state.salvaged = salvaged
         self._run_state.timed_out = timed_out
         self._run_state.raw_output = raw_output
+        self._run_state.limit_reason = limit_reason
+
+    @staticmethod
+    def _upstream_excerpt(text: str, limit: int = 1200) -> str:
+        """Keep the upstream error text readable in logs and intent notes."""
+        collapsed = " ".join((text or "").split())
+        return collapsed[-limit:] if len(collapsed) > limit else collapsed
 
     @classmethod
     def _salvaged_output(cls, text: str, mode: DispatchMode) -> str | None:
@@ -591,17 +761,57 @@ class CodexDockerAgent:
         return f"{message}\noutput_tail:\n{cleaned}"
 
     def _no_output_timeout_for_mode(self, mode: DispatchMode) -> int:
+        if getattr(self._run_state, "crypto_budget", None) is not None:
+            return 0
         return self.mode_no_output_timeout_seconds.get(mode.value, self.no_output_timeout_seconds)
 
     def _timeout_for_mode(self, mode: DispatchMode) -> int:
+        budget = getattr(self._run_state, "crypto_budget", None)
+        if budget is not None:
+            return budget.wall_seconds
         return self.mode_timeout_seconds.get(mode.value, self.timeout_seconds)
 
     def cancel_running(self) -> bool:
         with self._process_lock:
             processes = list(self._processes)
+            containers = list(self._crypto_containers)
+            self._cancelled_containers.update(containers)
         for process in processes:
             self._kill_process(process)
-        return bool(processes)
+        for container in containers:
+            try:
+                self._docker_container_control(["docker", "stop", "-t", "0", container])
+            except Exception:
+                # Cancellation is best-effort: a missing or unresponsive container must not
+                # break the stop API. run()'s finally skips its reset for cancelled containers,
+                # so invalidate the preflight cache here instead.
+                with self._preflight_lock:
+                    self._preflight_ready.discard(container)
+                continue
+        return bool(processes or containers)
+
+    @staticmethod
+    def _docker_container_control(command: list[str]) -> None:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError(f"crypto container cleanup failed: {completed.stderr.strip() or completed.stdout.strip()}")
+
+    def _set_crypto_memory_limit(self, container: str, budget: CryptoBudget) -> None:
+        self._docker_container_control([
+            "docker", "update", "--memory", f"{budget.memory_mb}m",
+            "--memory-swap", f"{budget.memory_mb}m", "--pids-limit", str(CRYPTO_PIDS_LIMIT),
+            "--cpus", "2", container,
+        ])
+
+    def _reset_crypto_container(self, container: str) -> None:
+        # A docker exec host process can exit while its container children survive.
+        # Restart is the process-tree boundary; S04's mounted inputs/artifacts persist.
+        try:
+            self._docker_container_control(["docker", "restart", "-t", "0", container])
+        finally:
+            # Even a failed/timed-out restart leaves the preflight cache untrustworthy.
+            with self._preflight_lock:
+                self._preflight_ready.discard(container)
 
     def _register_process(self, process: subprocess.Popen[str]) -> None:
         with self._process_lock:
@@ -719,7 +929,15 @@ class CodexWorker:
         prompt = f"{prompt}\n\n{self._isolation_note(intent.id)}"
         result = _invoke_agent(self.agent, project, prompt, mode, log, intent_id=intent.id)
         parsed = parse_worker_result(result.output)
+        if parsed.rejected and log is not None:
+            log(
+                f"worker output rejected {len(parsed.rejected)} malformed object(s); kept the rest",
+                "warning",
+                {"errors": parsed.rejected[:10]},
+            )
         parsed.timed_out = bool(getattr(result, "timed_out", False))
+        if project.task_type == "crypto" and getattr(result, "limit_reason", None):
+            parsed.crypto["exit_reason"] = result.limit_reason
         raw_output = getattr(result, "raw_output", "") or result.output
         if parsed.answer:
             parsed.answer_source = answer_source_context(raw_output, parsed.answer)

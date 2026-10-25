@@ -1,0 +1,10 @@
+# Worker-only cryptography tools. Keep versions fixed and install wheels only.
+pycryptodome==3.24.1
+sympy==1.14.0
+mpmath==1.3.0
+gmpy2==2.3.2
+z3-solver==4.15.4.0
+numpy==2.5.4
+scipy==1.18.1
+ecdsa==0.19.2
+cryptography==50.0.2

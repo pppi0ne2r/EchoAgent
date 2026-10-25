@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from uuid import uuid4
 
 from echo_agent.config import DispatcherSettings
 from echo_agent.dispatcher import Dispatcher
 from echo_agent.dispatcher.core import step_consumes_budget, step_requests_trailing_explore
 from echo_agent.models import Project, ProjectStatus
+from echo_agent.crypto_files import CryptoProjectFiles
+from echo_agent.crypto_service import CryptoProjectService
 from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
-from echo_agent.storage import SQLiteProjectStore
+from echo_agent.storage import SQLiteProjectStore, ProjectConflictError
 
 
 @dataclass(slots=True)
@@ -30,7 +33,9 @@ class DispatcherRunState:
 class DispatcherRunner:
     def __init__(self, store: SQLiteProjectStore, runtime: DockerProjectRuntime | None = None) -> None:
         self.store = store
-        self.runtime = runtime or DockerProjectRuntime.from_settings()
+        self.runtime = runtime or DockerProjectRuntime.from_settings(
+            project_data_root=store.database_path.parent / "projects"
+        )
         self._lock = threading.Lock()
         self._runs: dict[int, _RunHandle] = {}
 
@@ -50,6 +55,8 @@ class DispatcherRunner:
             existing = self._runs.get(project_id)
             if existing and existing.thread.is_alive():
                 return existing.state
+            if project.status == ProjectStatus.RUNNING and project.run_owner:
+                raise ProjectConflictError("project is already owned by a dispatcher; stop it before starting another run")
 
             stop_event = threading.Event()
             state = DispatcherRunState(project_id=project_id, running=True)
@@ -77,35 +84,55 @@ class DispatcherRunner:
                 state = handle.state
                 dispatcher = handle.dispatcher
                 thread = handle.thread
-        if dispatcher is not None:
-            dispatcher.request_stop()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout)
-            if thread.is_alive():
-                self._force_stop_container(project_id)
+        try:
+            if dispatcher is not None:
+                dispatcher.request_stop()
+            if thread is not None and thread.is_alive():
                 thread.join(timeout=join_timeout)
-        self._release_idle_project(project_id)
-        state.running = thread is not None and thread.is_alive()
+                if thread.is_alive():
+                    self._force_stop_container(project_id)
+                    thread.join(timeout=join_timeout)
+        finally:
+            # A failed cancel/force-stop must still release ownership, otherwise the project
+            # stays "running" and can never be started again.
+            try:
+                self._release_idle_project(project_id)
+            finally:
+                state.running = thread is not None and thread.is_alive()
         return state
 
     def _force_stop_container(self, project_id: int) -> None:
         project = self.store.get_project(project_id)
-        self.runtime.force_stop_project_container(
-            project,
-            log=lambda message, level="info", metadata=None: self.store.add_project_log(
+        try:
+            self.runtime.force_stop_project_container(
+                project,
+                log=lambda message, level="info", metadata=None: self.store.add_project_log(
+                    project.id,
+                    message,
+                    level=level,
+                    metadata=metadata or {},
+                ),
+            )
+        except (DockerRuntimeError, OSError) as exc:
+            self.store.add_project_log(
                 project.id,
-                message,
-                level=level,
-                metadata=metadata or {},
-            ),
-        )
+                f"forced container stop failed: {exc}",
+                level="error",
+                metadata={"docker": project.docker},
+            )
 
     def _release_idle_project(self, project_id: int) -> None:
+        with self.store.project_lock(project_id):
+            self._release_idle_project_locked(project_id)
+
+    def _release_idle_project_locked(self, project_id: int) -> None:
         project = self.store.get_project(project_id)
         if project.status != ProjectStatus.RUNNING:
             return
-        self.runtime.stop_project_container(
-            project,
+        old_status = project.status
+        project.stop()
+        self.runtime.apply_status_transition(
+            project, old_status,
             log=lambda message, level="info", metadata=None: self.store.add_project_log(
                 project.id,
                 message,
@@ -113,13 +140,12 @@ class DispatcherRunner:
                 metadata=metadata or {},
             ),
         )
-        project.stop()
         self.store.add_project_log(
             project.id,
             "project status transition: running -> stoped",
             metadata={"old_status": "running", "new_status": "stoped", "forced": False},
         )
-        self.store.save_project(project)
+        self.store.save_project(project, force_stop=True)
 
     def status(self, project_id: int) -> DispatcherRunState:
         with self._lock:
@@ -236,7 +262,10 @@ class DispatcherRunner:
             state.last_message = f"{type(exc).__name__}: {exc}"
             client.add_project_log(project_id, state.last_message, level="error")
         finally:
-            dispatcher._release_project_if_running(project_id)
+            try:
+                dispatcher._release_project_if_running(project_id)
+            except ProjectConflictError:
+                pass
             state.running = False
             client.add_project_log(
                 project_id,
@@ -247,13 +276,49 @@ class DispatcherRunner:
 class StoreDispatcherClient:
     def __init__(self, store: SQLiteProjectStore, runtime: DockerProjectRuntime | None = None) -> None:
         self.store = store
-        self.runtime = runtime or DockerProjectRuntime.from_settings()
+        self.dispatcher_id = uuid4().hex
+        self.runtime = runtime or DockerProjectRuntime.from_settings(
+            project_data_root=store.database_path.parent / "projects"
+        )
+        self.crypto_service = CryptoProjectService(
+            CryptoProjectFiles(store.database_path.parent / "projects"),
+            aes_image=getattr(self.runtime, "image", None),
+        )
 
     def get_project(self, project_id: int) -> Project:
         return self.store.get_project(project_id)
 
+    def verify_crypto_artifact(self, project_id: int, reference: dict) -> None:
+        if self.store.get_project(project_id).task_type != "crypto":
+            raise ValueError("artifact verification requires a crypto project")
+        self.crypto_service.files.verify_ref(project_id, reference, "artifact")
+
+    def verify_crypto_candidate(self, project_id: int, candidate_fact_id: int, *,
+                                verification_id: str | None = None,
+                                timeout_seconds: float | None = None) -> dict:
+        return self.crypto_service.verify(
+            self.store.get_project(project_id),
+            candidate_fact_id,
+            verification_id=verification_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def cancel_crypto_verification(self, project_id: int, verification_id: str) -> dict:
+        return {"cancelled": self.crypto_service.cancel(verification_id)}
+
     def save_project(self, project: Project) -> Project:
-        old_status = self.store.get_project(project.id).status
+        with self.store.project_lock(project.id):
+            return self._save_project_locked(project)
+
+    def _save_project_locked(self, project: Project) -> Project:
+        old_project = self.store.get_project(project.id)
+        if old_project.task_type == "crypto":
+            preserved = old_project.crypto.get("acceptances")
+            if preserved and project.crypto.get("acceptances") != preserved:
+                project.crypto["acceptances"] = preserved
+        self.store.check_write(project, dispatcher_id=self.dispatcher_id)
+        self.crypto_service.validate_save(old_project, project)
+        old_status = old_project.status
         if old_status != project.status:
             self.add_project_log(
                 project.id,
@@ -285,7 +350,7 @@ class StoreDispatcherClient:
                 f"project container lifecycle applied for {project.status.value}",
                 metadata={"docker": project.docker, "status": project.status.value},
             )
-        return self.store.save_project(project)
+        return self.store.save_project(project, dispatcher_id=self.dispatcher_id)
 
     def add_project_log(
         self,
