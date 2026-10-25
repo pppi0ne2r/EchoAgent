@@ -316,7 +316,10 @@ time.sleep(5)
             calls.append(list(command))
             return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
-        with patch("echo_agent.dispatcher.agents.subprocess.run", fake_run):
+        with (
+            patch("echo_agent.dispatcher.agents.subprocess.run", fake_run),
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=False),
+        ):
             agent._run_preflight(project, log=None)  # type: ignore[arg-type]
             agent._run_preflight(project, log=None)  # type: ignore[arg-type]
 

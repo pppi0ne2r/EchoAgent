@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,10 +11,13 @@ from echo_agent.server.docker_runtime import DockerProjectRuntime
 from echo_agent.system_proxy import (
     configured_proxy_environment,
     container_proxy_environment,
+    container_proxy_signature,
     proxy_build_arguments,
     proxy_docker_arguments,
     proxy_environment_arguments,
     proxy_exec_arguments,
+    proxy_signature,
+    system_proxy_settings,
 )
 
 
@@ -73,6 +77,59 @@ class SystemProxyTests(unittest.TestCase):
 
         self.assertEqual(environment["ALL_PROXY"], "socks5h://echo-agent-host:1080")
         self.assertNotIn("http_proxy", environment)
+
+    def test_linux_manual_proxy_uses_gnome_settings(self) -> None:
+        values = {
+            ("org.gnome.system.proxy", "mode"): "manual",
+            ("org.gnome.system.proxy.http", "host"): "127.0.0.1",
+            ("org.gnome.system.proxy.http", "port"): "7892",
+            ("org.gnome.system.proxy.https", "host"): "127.0.0.1",
+            ("org.gnome.system.proxy.https", "port"): "7892",
+            ("org.gnome.system.proxy.socks", "host"): "127.0.0.1",
+            ("org.gnome.system.proxy.socks", "port"): "7892",
+        }
+
+        def gsettings(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            value = values.get((command[2], command[3]), "")
+            return subprocess.CompletedProcess(command, 0, f"{value}\n", "")
+
+        with (
+            patch.dict("sys.modules", {"_scproxy": None}),
+            patch("echo_agent.system_proxy.subprocess.run", side_effect=gsettings),
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=True),
+        ):
+            settings = configured_proxy_environment()
+
+        self.assertEqual(settings["https_proxy"], "http://echo-agent-host:7892")
+
+    def test_linux_automatic_proxy_is_ignored(self) -> None:
+        completed = subprocess.CompletedProcess(["gsettings"], 0, "'auto'\n", "")
+        with (
+            patch.dict("sys.modules", {"_scproxy": None}),
+            patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+        ):
+            self.assertEqual(system_proxy_settings(), {})
+
+    def test_proxy_signature_ignores_unrelated_container_environment(self) -> None:
+        environment = container_proxy_environment(HTTP_SETTINGS)
+        self.assertEqual(
+            proxy_signature(environment)[1],
+            ("echo-agent-host:host-gateway",),
+        )
+        inspected = "\n".join([
+            '["PATH=/usr/bin", "https_proxy=http://echo-agent-host:7890", '
+            '"HTTPS_PROXY=http://echo-agent-host:7890", "http_proxy=http://echo-agent-host:7890", '
+            '"HTTP_PROXY=http://echo-agent-host:7890", '
+            '"no_proxy=localhost,127.0.0.1,::1,host.docker.internal,gateway.docker.internal,echo-agent-host", '
+            '"NO_PROXY=localhost,127.0.0.1,::1,host.docker.internal,gateway.docker.internal,echo-agent-host"]',
+            '["host.docker.internal:127.0.0.1", "echo-agent-host:host-gateway"]',
+        ]) + "\n"
+        completed = subprocess.CompletedProcess(["docker"], 0, inspected, "")
+        with (
+            patch("echo_agent.system_proxy.container_exists", return_value=True),
+            patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+        ):
+            self.assertEqual(container_proxy_signature("echo-agent-task-7"), proxy_signature(environment))
 
     def test_non_loopback_proxy_keeps_its_address(self) -> None:
         environment = container_proxy_environment({
@@ -136,6 +193,33 @@ class SystemProxyCommandTests(unittest.TestCase):
         self.assertNotIn("--add-host", command)
         self.assertIn("https_proxy=http://echo-agent-host:7890", preflight)
         self.assertNotIn("--add-host", preflight)
+
+    def test_existing_container_is_recreated_when_proxy_changes(self) -> None:
+        runtime = DockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+        )
+        project = type("ProjectStub", (), {"docker": "echo-agent-task-7", "task_type": "general"})()
+        commands: list[list[str]] = []
+
+        def run(_runtime: DockerProjectRuntime, command: list[str], **_: object) -> None:
+            commands.append(command)
+
+        with (
+            patch.object(DockerProjectRuntime, "_prepare_project_resources", return_value=[]),
+            patch.object(DockerProjectRuntime, "_project_workspace_mounts", return_value=[]),
+            patch.object(DockerProjectRuntime, "_extension_directory_mounts", return_value=[]),
+            patch.object(DockerProjectRuntime, "_extension_item_mounts", return_value=[]),
+            patch.object(DockerProjectRuntime, "_ensure_image"),
+            patch.object(DockerProjectRuntime, "_container_state", return_value="running"),
+            patch.object(DockerProjectRuntime, "_proxy_configuration_changed", return_value=True),
+            patch.object(DockerProjectRuntime, "_run", run),
+        ):
+            runtime.ensure_project_container(project)  # type: ignore[arg-type]
+
+        self.assertEqual(commands[0][:3], ["docker", "rm", "-f"])
+        self.assertEqual(commands[1][:2], ["docker", "run"])
 
 
 if __name__ == "__main__":
