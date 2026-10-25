@@ -31,6 +31,7 @@ from echo_agent.dispatcher.types import (
     WorkerResult,
 )
 from echo_agent.models import Intent, Project
+from echo_agent.system_proxy import proxy_exec_arguments
 
 
 TRANSIENT_UPSTREAM_MARKERS = (
@@ -266,6 +267,7 @@ class CodexDockerAgent:
             command.extend(["-e", f"OPENAI_API_KEY={self.openai_api_key}"])
         if self.openai_base_url:
             command.extend(["-e", f"OPENAI_BASE_URL={self.openai_base_url}"])
+        command.extend(proxy_exec_arguments())
         workspace = self.workspace
         if runtime_key is not None:
             codex_home, workspace = self.runtime_paths(runtime_key)
@@ -362,6 +364,7 @@ class CodexDockerAgent:
             command.extend(["-e", f"OPENAI_API_KEY={self.openai_api_key}"])
         if self.openai_base_url:
             command.extend(["-e", f"OPENAI_BASE_URL={self.openai_base_url}"])
+        command.extend(proxy_exec_arguments())
         script = (
             'echo "workspace=$(pwd)"; '
             'echo "codex_path=$(command -v codex || true)"; '

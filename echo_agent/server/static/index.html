@@ -290,10 +290,21 @@
               清除已保存的 API Key
             </label>
           </section>
+          <section class="settings-card settings-card-wide">
+            <header>
+              <h2>网络</h2>
+              <p>开启后，新建容器、镜像构建和 Codex 使用 macOS 系统代理。已有容器需要重新创建后，容器内的主机名才会生效。</p>
+            </header>
+            <label class="check-label hint-toggle">
+              <input name="use_system_proxy" type="checkbox" />
+              使用系统代理
+            </label>
+            <p class="settings-note">读取系统设置中的 HTTP、HTTPS 或 SOCKS 代理。系统代理未开启时，勾选也不会改变网络。</p>
+          </section>
         </div>
       </form>
     </section>
 
-    <script src="/static/app.js?v=44"></script>
+    <script src="/static/app.js?v=45"></script>
   </body>
 </html>

@@ -17,6 +17,7 @@ def save_console_settings(
     model: str,
     api_key: str | None = None,
     clear_api_key: bool = False,
+    use_system_proxy: bool = False,
 ) -> dict[str, object]:
     if max_concurrent_projects < 1:
         raise ValueError("max_concurrent_projects must be at least 1")
@@ -57,6 +58,9 @@ def save_console_settings(
                 f"base_url = {_toml_string(cleaned_url)}",
                 f"api_key = {_toml_string(stored_key)}",
                 "",
+                "[docker]",
+                f"use_system_proxy = {'true' if use_system_proxy else 'false'}",
+                "",
             ]
         ),
         encoding="utf-8",
@@ -86,6 +90,7 @@ def _public_settings(settings: DispatcherSettings) -> dict[str, object]:
         "models_unified": len(models) <= 1,
         "api_key_set": bool(key),
         "api_key_hint": key[-4:] if len(key) > 4 else "",
+        "use_system_proxy": settings.use_system_proxy,
     }
 
 

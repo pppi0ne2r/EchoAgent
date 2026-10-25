@@ -75,6 +75,7 @@ class DispatcherSettings:
     project_docker_context: Path
     project_dockerfile: Path
     project_docker_build_network: str | None
+    use_system_proxy: bool = False
     project_resource_root: Path
     project_resources: tuple[ProjectResource, ...] = ()
     codex_command: tuple[str, ...]
@@ -245,6 +246,13 @@ class DispatcherSettings:
             project_docker_build_network=_optional_setting(
                 "ECHO_AGENT_PROJECT_DOCKER_BUILD_NETWORK",
                 _config_value(config, "docker", "build_network"),
+            ),
+            use_system_proxy=_bool_setting(
+                "ECHO_AGENT_USE_SYSTEM_PROXY",
+                config,
+                "docker",
+                "use_system_proxy",
+                default=False,
             ),
             project_resource_root=_path_setting(
                 config,
@@ -420,6 +428,32 @@ def _path_setting(config: dict[str, Any], value: Any) -> Path:
     if isinstance(config_dir, Path):
         return config_dir / path
     return path
+
+
+def _bool_setting(
+    env_name: str,
+    config: dict[str, Any],
+    section: str,
+    key: str,
+    *,
+    default: bool = False,
+) -> bool:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        raw = _config_value(config, section, key, default=default)
+    return _parse_bool(raw, f"{section}.{key}")
+
+
+def _parse_bool(value: Any, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"EchoAgent config {label} must be a boolean")
 
 
 def _bool_config_value(

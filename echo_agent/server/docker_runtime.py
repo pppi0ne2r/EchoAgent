@@ -17,6 +17,7 @@ from echo_agent.crypto_files import CryptoProjectFiles
 from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, DEFAULT_MEMORY_MB
 from echo_agent.models import Project, ProjectStatus
 from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError, extension_resource
+from echo_agent.system_proxy import configured_proxy_environment, proxy_build_arguments, proxy_docker_arguments
 from echo_agent.server.attachments import CONTAINER_ATTACHMENT_DIR
 from echo_agent.server.project_workspace import CONTAINER_WORK_DIR, ProjectWorkspace
 
@@ -234,6 +235,7 @@ class DockerProjectRuntime:
                     "--add-host",
                     "gateway.docker.internal:127.0.0.1",
         ]
+        command.extend(proxy_docker_arguments(configured_proxy_environment()))
         if crypto:
             command.extend(["--init", "--memory", f"{DEFAULT_MEMORY_MB}m",
                             "--memory-swap", f"{DEFAULT_MEMORY_MB}m",
@@ -367,6 +369,7 @@ class DockerProjectRuntime:
         command = ["docker", "build"]
         if self.build_network:
             command.extend(["--network", self.build_network])
+        command.extend(proxy_build_arguments(configured_proxy_environment()))
         command.extend(["-t", self.image, "-f", str(self.dockerfile), str(self.context)])
         return command
 

@@ -84,6 +84,8 @@ class ConsoleSettingsTests(unittest.TestCase):
         self.assertEqual(loaded.openai_api_key, "sk-secret-value")
         self.assertEqual(visible["api_key_hint"], "alue")
         self.assertNotIn("sk-secret-value", str(visible))
+        self.assertFalse(saved["use_system_proxy"])
+        self.assertFalse(loaded.use_system_proxy)
 
     def test_blank_key_keeps_the_saved_key_and_env_still_wins(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -112,6 +114,24 @@ class ConsoleSettingsTests(unittest.TestCase):
 
         self.assertTrue(kept["api_key_set"])
         self.assertEqual(overridden.codex_max_slots, 9)
+
+    def test_system_proxy_setting_round_trips_and_env_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text(MINIMAL_CONFIG, encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                saved = save_console_settings(
+                    max_concurrent_projects=2,
+                    codex_max_slots=2,
+                    explore_max_workers=4,
+                    base_url="https://gateway.example/v1",
+                    model="grok-4.7",
+                    use_system_proxy=True,
+                )
+                self.assertTrue(saved["use_system_proxy"])
+                self.assertTrue(DispatcherSettings.from_env().use_system_proxy)
+                with patch.dict(os.environ, {"ECHO_AGENT_USE_SYSTEM_PROXY": "false"}):
+                    self.assertFalse(DispatcherSettings.from_env().use_system_proxy)
 
 
 if __name__ == "__main__":

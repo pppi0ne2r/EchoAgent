@@ -2433,6 +2433,7 @@ async function loadSettings() {
   form.model.value = settings.model || "";
   form.api_key.value = "";
   form.clear_api_key.checked = false;
+  form.use_system_proxy.checked = Boolean(settings.use_system_proxy);
   if (els.apiKeyHint) {
     els.apiKeyHint.textContent = settings.api_key_set
       ? `当前已保存 API Key${settings.api_key_hint ? `，末尾 ${settings.api_key_hint}` : ""}。留空则保持不变。`
@@ -2463,6 +2464,7 @@ els.settingsForm?.addEventListener("submit", async (event) => {
         model: data.get("model"),
         api_key: data.get("api_key") || null,
         clear_api_key: data.get("clear_api_key") === "on",
+        use_system_proxy: data.get("use_system_proxy") === "on",
       }),
     });
     await loadSettings();

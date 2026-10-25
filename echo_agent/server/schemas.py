@@ -94,6 +94,7 @@ class ConsoleSettingsUpdate(BaseModel):
     model: str
     api_key: str | None = None
     clear_api_key: bool = False
+    use_system_proxy: bool = False
 
 
 class ExtensionCreateRequest(BaseModel):
