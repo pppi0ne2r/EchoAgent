@@ -21,6 +21,9 @@ const state = {
   logRequest: 0,
   logTimer: null,
   showDetailLogs: false,
+  writeupStatus: null,
+  writeupTimer: null,
+  writeupDownloadPending: false,
 };
 
 const els = {
@@ -33,6 +36,7 @@ const els = {
   editProject: document.querySelector("#edit-project"),
   runProject: document.querySelector("#run-project"),
   stopProject: document.querySelector("#stop-project"),
+  exportWriteup: document.querySelector("#export-writeup"),
   deleteProject: document.querySelector("#delete-project"),
   title: document.querySelector("#project-title"),
   subtitle: document.querySelector("#project-subtitle"),
@@ -53,10 +57,13 @@ const els = {
   attachmentNote: document.querySelector("#attachment-note"),
   createError: document.querySelector("#create-error"),
   submitCreate: document.querySelector("#submit-create"),
-  openSettings: document.querySelector("#open-settings"),
-  closeSettings: document.querySelector("#close-settings"),
-  settingsDialog: document.querySelector("#settings-dialog"),
+  navProjects: document.querySelector("#nav-projects"),
+  navExtensions: document.querySelector("#nav-extensions"),
+  navSettings: document.querySelector("#nav-settings"),
+  extensionsPage: document.querySelector("#extensions-page"),
+  settingsPage: document.querySelector("#settings-page"),
   settingsForm: document.querySelector("#settings-form"),
+  settingsStatus: document.querySelector("#settings-status"),
   apiKeyHint: document.querySelector("#api-key-hint"),
 };
 
@@ -184,6 +191,9 @@ async function selectProject(projectId) {
   if (state.currentProjectId !== projectId) {
     state.userGraphZoom = false;
     state.logFollow = true;
+    state.writeupStatus = null;
+    state.writeupDownloadPending = false;
+    stopWriteupPoll();
     if (els.graphViewport) {
       els.graphViewport.scrollLeft = 0;
       els.graphViewport.scrollTop = 0;
@@ -199,6 +209,7 @@ async function refreshCurrent() {
   state.currentProject = await api(`/projects/${state.currentProjectId}`);
   state.runStatus = await api(`/projects/${state.currentProjectId}/run`);
   state.runs = await api("/projects/runs");
+  await refreshWriteupStatus();
   renderCurrentProject();
   await loadLogs();
   await refreshProjectsOnly();
@@ -328,7 +339,14 @@ function updateActionButtons() {
   els.runProject.disabled = !hasProject || state.busy || !canRun;
   els.stopProject.disabled = !hasProject || state.busy || !canStop;
   els.deleteProject.disabled = !hasProject || state.busy || canStop;
-  els.uploadForm.querySelector('button[type="submit"]').disabled = !hasProject || state.busy || project.task_type !== "crypto" || canStop || project.status === "completed";
+  if (els.uploadForm) {
+    els.uploadForm.querySelector('button[type="submit"]').disabled = !hasProject || state.busy || project.task_type !== "crypto" || canStop || project.status === "completed";
+  }
+  if (els.exportWriteup) {
+    const generating = state.writeupStatus?.status === "running";
+    els.exportWriteup.disabled = !hasProject || state.busy || generating;
+    els.exportWriteup.textContent = generating ? "生成中" : "导出 WP";
+  }
 }
 
 const MODE_LABELS = {
@@ -336,6 +354,7 @@ const MODE_LABELS = {
   "first-run": "首次执行",
   explore: "探索",
   reason: "推理",
+  writeup: "撰写 WP",
   completed: "已完成",
   skipped: "已跳过",
 };
@@ -414,7 +433,12 @@ function isScheduleLog(log) {
   if (/^explore started with \d+ active intents$/.test(message)) return true;
   if (/^explore intent \d+ (finished|released for retry)$/.test(message)) return true;
   if (message === "first-run finished") return true;
+  if (isWriteupLog(message)) return true;
   return Boolean(finalResultText(message, log.metadata || {}));
+}
+
+function isWriteupLog(message) {
+  return message === "开始生成 WP" || message === "WP 已生成" || message.startsWith("生成 WP 失败");
 }
 
 function phaseSummary(log) {
@@ -422,6 +446,7 @@ function phaseSummary(log) {
   const metadata = log.metadata || {};
   const finalResult = finalResultText(message, metadata);
   if (finalResult) return finalResult;
+  if (isWriteupLog(message)) return message;
   const step = message.match(/^server dispatcher step (\d+) finished$/);
   if (step) {
     const mode = modeLabel(metadata.mode) || "步骤";
@@ -580,6 +605,11 @@ function renderRunStatus() {
     bar.className = "run-status-bar is-queued";
     return;
   }
+  if (state.writeupStatus?.status === "running") {
+    bar.textContent = "正在生成 WP";
+    bar.className = "run-status-bar is-running";
+    return;
+  }
   bar.textContent = "空闲";
   bar.className = "run-status-bar is-idle";
 }
@@ -721,7 +751,7 @@ function answerBasisFactId(answer) {
 }
 
 function phaseTitle(phase) {
-  const name = phase.kind === "first" ? "首次执行" : phase.kind === "reason" ? "推理" : "探索";
+  const name = phase.kind === "first" ? "首次执行" : phase.kind === "reason" ? "推理" : phase.kind === "writeup" ? "撰写 WP" : "探索";
   const status = phase.status === "done" ? "已完成" : phase.status === "stopped" ? "已停止" : "进行中";
   return `${name} · ${status}`;
 }
@@ -750,7 +780,16 @@ function scheduleRows(phase) {
     time: phase.time,
     text: phaseTitle(phase),
   }];
-  if (phase.kind === "reason") {
+  if (phase.kind === "writeup") {
+    if (phase.result && phase.status !== "stopped") {
+      rows.push({
+        id: `${phase.id}-result`,
+        role: "child",
+        level: phase.status === "done" ? "success" : "info",
+        text: phase.result,
+      });
+    }
+  } else if (phase.kind === "reason") {
     if (phase.result.startsWith("项目完成")) {
       const basis = answerBasisFactId(phase.answer);
       rows.push({
@@ -851,6 +890,21 @@ function scheduleNarrative(logs) {
   for (const log of logs) {
     const message = logMessage(log);
     const metadata = log.metadata || {};
+    if (isWriteupLog(message)) {
+      if (!current || current.kind !== "writeup" || (message === "开始生成 WP" && current.done)) start("writeup", log);
+      touch(log);
+      if (message === "开始生成 WP") {
+        current.result = "开始生成 WP";
+      } else if (message === "WP 已生成") {
+        current.done = true;
+        current.status = "done";
+        current.result = "WP 已生成";
+        current.level = "success";
+      } else {
+        markStopped(message);
+      }
+      continue;
+    }
     if (message === "project entered first_run mode") {
       start("first", log);
       continue;
@@ -1903,7 +1957,8 @@ function scheduleRefresh() {
   state.logTimer = setInterval(() => {
     if (!state.currentProjectId) return;
     renderRunStatus();
-    if (state.busy || !(state.runStatus?.running || state.runStatus?.queued)) return;
+    const writeupRunning = state.writeupStatus?.status === "running";
+    if (state.busy || !(state.runStatus?.running || state.runStatus?.queued || writeupRunning)) return;
     loadLogs().catch(() => {});
   }, 2000);
 }
@@ -1933,6 +1988,9 @@ function clearCurrentProject() {
   state.logProjectId = null;
   state.logAfterId = 0;
   state.logFollow = true;
+  state.writeupStatus = null;
+  state.writeupDownloadPending = false;
+  stopWriteupPoll();
   renderRunStatus();
   updateActionButtons();
 }
@@ -2216,15 +2274,110 @@ els.clearLogs.addEventListener("click", async () => {
   });
 });
 
+function stopWriteupPoll() {
+  if (!state.writeupTimer) return;
+  clearTimeout(state.writeupTimer);
+  state.writeupTimer = null;
+}
+
+function ensureWriteupPoll() {
+  if (state.writeupTimer || state.writeupStatus?.status !== "running") return;
+  state.writeupTimer = setTimeout(() => {
+    state.writeupTimer = null;
+    pollWriteup().catch((error) => setStatus(`error · ${error.message}`));
+  }, 2000);
+}
+
+async function refreshWriteupStatus() {
+  if (!state.currentProjectId) return;
+  const projectId = state.currentProjectId;
+  const status = await api(`/projects/${projectId}/writeup`);
+  if (state.currentProjectId !== projectId) return;
+  state.writeupStatus = status;
+  updateActionButtons();
+  if (status.status === "running") ensureWriteupPoll();
+}
+
+async function downloadWriteup(projectId, filename) {
+  const headers = {};
+  const token = authToken();
+  if (token) headers["X-Echo-Agent-Token"] = token;
+  const response = await fetch(`/projects/${projectId}/writeup/download`, { headers });
+  if (response.status === 401) {
+    const entered = window.prompt("需要访问令牌（X-Echo-Agent-Token）：");
+    if (entered && entered.trim()) {
+      localStorage.setItem("echoAgentToken", entered.trim());
+      return downloadWriteup(projectId, filename);
+    }
+    throw new Error("unauthorized");
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail || body.error || `${response.status} ${response.statusText}`);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "wp.md";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function pollWriteup() {
+  if (!state.currentProjectId) return;
+  const projectId = state.currentProjectId;
+  const previous = state.writeupStatus?.status;
+  await refreshWriteupStatus();
+  if (state.currentProjectId !== projectId) return;
+  await loadLogs().catch(() => {});
+  const status = state.writeupStatus;
+  if (!status || status.status === "running") return;
+  if (previous === "running" && state.writeupDownloadPending && status.status === "ready") {
+    state.writeupDownloadPending = false;
+    await downloadWriteup(projectId, status.filename);
+    setStatus("done · WP 已生成");
+    return;
+  }
+  if (status.status === "error") {
+    state.writeupDownloadPending = false;
+    setStatus(`error · ${status.error || "生成 WP 失败"}`);
+  }
+}
+
+els.exportWriteup?.addEventListener("click", async () => {
+  if (!state.currentProjectId || state.writeupStatus?.status === "running") return;
+  let readyNow = false;
+  await withAction("开始生成 WP...", async () => {
+    const status = await api(`/projects/${state.currentProjectId}/writeup`, { method: "POST" });
+    state.writeupStatus = status;
+    state.writeupDownloadPending = status.status === "running";
+    readyNow = status.status === "ready";
+    updateActionButtons();
+  });
+  if (readyNow && state.currentProjectId) {
+    await downloadWriteup(state.currentProjectId, state.writeupStatus?.filename);
+    setStatus("done · WP 已生成");
+    return;
+  }
+  ensureWriteupPoll();
+});
+
 els.runProject.addEventListener("click", async () => {
   if (!state.currentProjectId) return;
-  await withAction("starting dispatcher...", async () => {
-    await api(`/projects/${state.currentProjectId}/run`, {
-      method: "POST",
-      body: JSON.stringify({}),
+  try {
+    await withAction("starting dispatcher...", async () => {
+      await api(`/projects/${state.currentProjectId}/run`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await refreshCurrent();
     });
-    await refreshCurrent();
-  });
+  } finally {
+    loadExtensions().catch(() => {});
+  }
 });
 
 els.stopProject.addEventListener("click", async () => {
@@ -2252,27 +2405,32 @@ els.stopAll.addEventListener("click", async () => {
   });
 });
 
-els.openSettings.addEventListener("click", async () => {
+async function loadSettings() {
   const settings = await api("/settings");
   const form = els.settingsForm;
+  if (!form) return settings;
   form.max_concurrent_projects.value = settings.max_concurrent_projects;
   form.codex_max_slots.value = settings.codex_max_slots;
   form.base_url.value = settings.base_url || "";
   form.model.value = settings.model || "";
   form.api_key.value = "";
   form.clear_api_key.checked = false;
-  els.apiKeyHint.textContent = settings.api_key_set
-    ? `当前已保存 API Key${settings.api_key_hint ? `，末尾 ${settings.api_key_hint}` : ""}。留空则保持不变。`
-    : "当前没有 API Key。";
-  if (!settings.models_unified) {
-    els.apiKeyHint.textContent += " 各模式模型目前不一致，保存后会统一成上面的模型。";
+  if (els.apiKeyHint) {
+    els.apiKeyHint.textContent = settings.api_key_set
+      ? `当前已保存 API Key${settings.api_key_hint ? `，末尾 ${settings.api_key_hint}` : ""}。留空则保持不变。`
+      : "当前没有 API Key。";
+    if (!settings.models_unified) {
+      els.apiKeyHint.textContent += " 各模式模型目前不一致，保存后会统一成上面的模型。";
+    }
   }
-  els.settingsDialog.showModal();
-});
+  if (els.settingsStatus) {
+    els.settingsStatus.hidden = true;
+    els.settingsStatus.textContent = "";
+  }
+  return settings;
+}
 
-els.closeSettings.addEventListener("click", () => els.settingsDialog.close());
-
-els.settingsForm.addEventListener("submit", async (event) => {
+els.settingsForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = els.settingsForm;
   const data = new FormData(form);
@@ -2289,7 +2447,11 @@ els.settingsForm.addEventListener("submit", async (event) => {
         clear_api_key: data.get("clear_api_key") === "on",
       }),
     });
-    els.settingsDialog.close();
+    await loadSettings();
+    if (els.settingsStatus) {
+      els.settingsStatus.hidden = false;
+      els.settingsStatus.textContent = "已保存。之后启动的项目会使用这份配置。";
+    }
   });
 });
 
@@ -2313,5 +2475,191 @@ if (window.ResizeObserver && els.graphViewport) {
   observer.observe(els.graphViewport);
 }
 
+const EXTENSION_STATUS = {
+  ready: "已下载",
+  missing: "未下载",
+  failed: "下载失败",
+};
+
+let currentPage = "projects";
+
+function showPage(page) {
+  const extensions = page === "extensions";
+  const settings = page === "settings";
+  const entering = page !== currentPage;
+  currentPage = page;
+  if (els.layout) els.layout.hidden = extensions || settings;
+  if (els.extensionsPage) els.extensionsPage.hidden = !extensions;
+  if (els.settingsPage) els.settingsPage.hidden = !settings;
+  els.navProjects?.classList.toggle("is-active", page === "projects");
+  els.navExtensions?.classList.toggle("is-active", extensions);
+  els.navSettings?.classList.toggle("is-active", settings);
+  if (extensions) loadExtensions().catch((error) => setStatus(`error · ${error.message}`));
+  if (settings && entering) loadSettings().catch((error) => setStatus(`error · ${error.message}`));
+}
+
+function selectExtensionKind(kind) {
+  for (const tab of els.extensionsPage?.querySelectorAll(".extension-tab") || []) {
+    tab.classList.toggle("is-active", tab.dataset.kind === kind);
+  }
+  for (const column of els.extensionsPage?.querySelectorAll(".extension-column") || []) {
+    column.classList.toggle("is-active", column.dataset.kind === kind);
+  }
+}
+
+function renderExtensions(items) {
+  const failed = items.filter((item) => item.status === "failed");
+  if (els.navExtensions) {
+    els.navExtensions.textContent = failed.length ? `扩展 ${failed.length}` : "扩展";
+    els.navExtensions.classList.toggle("has-failure", failed.length > 0);
+  }
+  for (const tab of els.extensionsPage?.querySelectorAll(".extension-tab") || []) {
+    const entries = items.filter((item) => item.kind === tab.dataset.kind);
+    const failedCount = entries.filter((item) => item.status === "failed").length;
+    const count = tab.querySelector("[data-count]");
+    if (count) count.textContent = failedCount ? `${entries.length} · ${failedCount} 失败` : String(entries.length);
+    tab.classList.toggle("has-failure", failedCount > 0);
+  }
+  for (const column of els.extensionsPage?.querySelectorAll(".extension-column") || []) {
+    const kind = column.dataset.kind;
+    const list = column.querySelector(".extension-list");
+    if (!list) continue;
+    list.replaceChildren();
+    const entries = items.filter((item) => item.kind === kind);
+    if (!entries.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "还没有条目";
+      list.appendChild(empty);
+      continue;
+    }
+    for (const item of entries) {
+      const card = document.createElement("article");
+      card.className = "extension-card";
+      const status = EXTENSION_STATUS[item.status] || item.status;
+      const path = item.container_path || "";
+      const version = item.version || "未记录版本";
+      const size = formatBytes(item.size);
+      card.innerHTML = `
+        <div class="extension-main">
+          <header>
+            <strong>${escapeHtml(item.name)}</strong>
+            <span class="extension-status ${escapeHtml(item.status)}">${escapeHtml(status)}</span>
+          </header>
+          <p class="extension-version" title="${escapeHtml(item.url)}">${escapeHtml(version)}${size ? ` · ${escapeHtml(size)}` : ""}</p>
+          ${path ? `<p class="extension-path" title="${escapeHtml(path)}">${escapeHtml(path)}</p>` : ""}
+          ${item.error ? `<p class="failure">${escapeHtml(item.error)}</p>` : ""}
+        </div>
+      `;
+      const actions = document.createElement("div");
+      actions.className = "extension-actions";
+      const update = document.createElement("button");
+      update.type = "button";
+      update.className = "ghost-button extension-update";
+      update.textContent = "更新";
+      update.addEventListener("click", () => updateExtension(item));
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "danger ghost-button extension-delete";
+      button.textContent = "删除";
+      button.addEventListener("click", async () => {
+        const confirmed = window.confirm(`删除扩展「${item.name}」？已下载的文件会保留。`);
+        if (!confirmed) return;
+        await api(`/extensions/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+        await loadExtensions();
+      });
+      actions.append(update, button);
+      card.appendChild(actions);
+      list.appendChild(card);
+    }
+  }
+}
+
+async function loadExtensions() {
+  const items = await api("/extensions");
+  renderExtensions(items);
+  return items;
+}
+
+function formatBytes(size) {
+  const value = Number(size);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function updateExtension(item) {
+  const current = item.version ? `当前是 ${item.version}。` : "";
+  const confirmed = window.confirm(`更新「${item.name}」？${current}会下载最新版本并覆盖已有文件。`);
+  if (!confirmed) return;
+  let updated = null;
+  try {
+    updated = await withAction(`正在更新 ${item.name}...`, async () => api(`/extensions/${encodeURIComponent(item.id)}/update`, { method: "POST" }));
+  } finally {
+    await loadExtensions().catch(() => {});
+  }
+  if (updated?.version) setStatus(`${item.name} 已更新到 ${updated.version}`);
+}
+
+els.navProjects?.addEventListener("click", () => showPage("projects"));
+els.navExtensions?.addEventListener("click", () => showPage("extensions"));
+els.navSettings?.addEventListener("click", () => showPage("settings"));
+els.extensionsPage?.querySelector(".extension-nav")?.addEventListener("click", (event) => {
+  const tab = event.target.closest(".extension-tab");
+  if (tab?.dataset.kind) selectExtensionKind(tab.dataset.kind);
+});
+document.querySelector("#restart-containers")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const confirmed = window.confirm("重启全部已有项目容器？正在运行的任务会中断。尚未创建的容器不会新建。");
+  if (!confirmed) return;
+  if (button instanceof HTMLButtonElement) button.disabled = true;
+  try {
+    const result = await withAction("restarting containers...", async () => api("/containers/restart", { method: "POST" }));
+    const restarted = result.restarted?.length || 0;
+    const skipped = result.skipped?.length || 0;
+    const failed = result.failed || [];
+    if (failed.length && !restarted) {
+      setStatus(`error · ${failed.map((item) => `${item.name}：${item.error}`).join("；")}`);
+      return;
+    }
+    setStatus(`容器已重启 ${restarted} 个，跳过 ${skipped} 个${failed.length ? `，失败 ${failed.length} 个` : ""}`);
+  } catch {
+  } finally {
+    if (button instanceof HTMLButtonElement) button.disabled = false;
+  }
+});
+for (const button of els.extensionsPage?.querySelectorAll(".extension-update-all") || []) {
+  button.addEventListener("click", async () => {
+    const kind = button.dataset.kind;
+    const confirmed = window.confirm("更新当前分类的全部条目？预置工具会查询 GitHub 最新版本，其余条目按当前链接重新下载。已有文件会被覆盖。");
+    if (!confirmed) return;
+    try {
+      await withAction("updating extensions...", async () => {
+        await api(`/extensions/update?kind=${encodeURIComponent(kind || "")}`, { method: "POST" });
+      });
+    } finally {
+      await loadExtensions().catch(() => {});
+    }
+  });
+}
+for (const form of els.extensionsPage?.querySelectorAll(".extension-form") || []) {
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const column = form.closest(".extension-column");
+    const data = new FormData(form);
+    await withAction("adding extension...", async () => {
+      const kind = column?.dataset.kind;
+      await api("/extensions", {
+        method: "POST",
+        body: JSON.stringify({ kind, url: String(data.get("url") || "").trim() }),
+      });
+      form.reset();
+      await loadExtensions();
+    });
+  });
+}
+
 bindGraphInteractions();
 loadProjects();
+loadExtensions().catch(() => {});

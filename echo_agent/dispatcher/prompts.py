@@ -150,6 +150,28 @@ class PromptBuilder:
             ]
         )
 
+    def build_writeup_prompt(self, project: Project) -> str:
+        return "\n".join(
+            [
+                "你是 CTF writeup 作者，当前任务只生成解题报告，不要继续做题。",
+                "不要访问目标，不要运行利用、扫描或攻击命令。只阅读已有材料和日志。",
+                "材料目录是 /home/kali/workspace/writeup-input/。",
+                "project.json 是项目事实图，runtime.jsonl 是调度和执行日志。",
+                "解题过程中产生的命令和文件在 /home/kali/workspace/intents/。",
+                "题目附件在 /home/kali/attachments/，只在需要核对题目文件时读取。",
+                "根据这些材料写一份中文 Markdown writeup，并写入绝对路径 /home/kali/workspace/writeup.md。",
+                "当前工作目录可能是 /home/kali/workspace/writeup，不要把报告写到相对路径或其他文件。",
+                "必须包含这些小节：题目信息、结论、解题过程、关键命令与结果、flag。",
+                "只能写材料里出现过的事实、命令和 flag。材料没有的内容要明确写未记录，不要编造。",
+                "如果没有获得 flag，flag 一节写未获得。",
+                "写完文件后，最终回复只保留一行：WP 已写入 /home/kali/workspace/writeup.md",
+                "",
+                "项目名称：" + (project.name or ""),
+                "目标：" + (project.target_url or ""),
+                "目的：" + (project.objective or ""),
+            ]
+        )
+
     def build_reason_prompt(self, project: Project) -> str:
         if project.task_type == "crypto":
             return _build_crypto_reason_prompt(project)

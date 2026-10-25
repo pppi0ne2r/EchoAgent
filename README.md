@@ -61,56 +61,24 @@ Important sections:
 - `[dispatcher]`: loop interval, per-project Codex slots, and how many projects may run together.
 - `[codex]`: Codex CLI command, models, provider, retries, timeouts.
 - `[docker]`: worker image build/run settings.
-- `[resources]`: shared resources prepared on startup and mounted into containers.
+- `[resources]`: host directory for the extension catalog. The tool list itself lives in the Extensions page.
 
 Use `echo_agent.toml` for local configuration and keep real secrets out of commits. `echo_agent.toml` is ignored by git; commit `echo_agent.toml.example` as the shared template.
 
 ## Shared Resources
 
-Resources are configured in `echo_agent.toml`:
+Tools, knowledge bases, and skills are configured on the web UI's Extensions page. EchoAgent stores that catalog in `extensions.json` and downloads the files into `[resources].root`.
 
-```toml
-[resources]
-root = ".echo_agent/resources"
-items = [
-  { name = "nuclei-templates", url = "https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.zip", archive = true, path = "nuclei-templates", container_path = "/home/kali/.local/nuclei-templates", read_only = false },
-  { name = "katana", url = "https://github.com/projectdiscovery/katana/releases/download/v1.5.0/katana_1.5.0_linux_amd64.zip", archive = true, archive_single_file = true, executable = true, path = "local-bin/katana", container_path = "/home/kali/.local/bin/katana", read_only = true },
-  { name = "nuclei", url = "https://github.com/projectdiscovery/nuclei/releases/download/v3.7.1/nuclei_3.7.1_linux_amd64.zip", archive = true, archive_single_file = true, executable = true, path = "local-bin/nuclei", container_path = "/home/kali/.local/bin/nuclei", read_only = true },
-  { name = "dalfox", url = "https://github.com/hahwul/dalfox/releases/download/v2.12.0/dalfox-linux-amd64.tar.gz", archive = true, archive_single_file = true, executable = true, path = "local-bin/dalfox", container_path = "/home/kali/.local/bin/dalfox", read_only = true },
-  { name = "cloudfox", url = "https://github.com/BishopFox/cloudfox/releases/download/v2.0.1/cloudfox-linux-amd64.zip", archive = true, archive_single_file = true, executable = true, path = "local-bin/cloudfox", container_path = "/home/kali/.local/bin/cloudfox", read_only = true },
-  { name = "kerbrute", url = "https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64", executable = true, path = "local-bin/kerbrute", container_path = "/home/kali/.local/bin/kerbrute", read_only = true },
-  { name = "pocs", path = "pocs", container_path = "/home/kali/pocs", read_only = false },
-  { name = "tools", path = "tools", container_path = "/home/kali/tools", read_only = false },
-  { name = "knowledges", path = "knowledges", container_path = "/home/kali/knowledges", read_only = false },
-]
-```
+Built-in entries are seeded on first start:
 
-When the server starts, EchoAgent prepares shared resources:
+- Tools on `PATH`: katana, nuclei, dalfox, cloudfox, mounted at `/home/kali/.local/bin`.
+- `ysoserial` at `/home/kali/tools/ysoserial.jar`.
+- `nuclei-templates` at `/home/kali/.local/nuclei-templates`.
+- Shared directories: `/home/kali/tools`, `/home/kali/knowledges`, `/home/kali/pocs`, and skills at `/home/kali/.agents/skills`.
 
-- If `url` is absent, it creates the directory.
-- If `url` is present, it downloads the file once.
-- If `archive = true`, it extracts zip/tar archives into the resource path.
-- If `archive_single_file = true`, it extracts the first file in the archive to exactly `path`.
-- If `executable = true`, it applies executable permissions to the downloaded/extracted file(s).
-- Existing non-empty directories/files are reused.
+The server downloads missing files when it starts. A project run checks them again and stops if a download fails. Use Update on the Extensions page to download the current URL again and replace an existing file. Add or remove entries from the Extensions page; do not keep a second list in `echo_agent.toml`.
 
-When a project container is created, these resources are mounted at their configured `container_path`.
-
-Inside the worker container, the default paths are:
-
-```text
-/home/kali/.local/nuclei-templates
-/home/kali/.local/bin/katana
-/home/kali/.local/bin/nuclei
-/home/kali/.local/bin/dalfox
-/home/kali/.local/bin/cloudfox
-/home/kali/.local/bin/kerbrute
-/home/kali/pocs
-/home/kali/tools
-/home/kali/knowledges
-```
-
-`/home/kali/.local/bin` is already in the worker container PATH, so these mounted tools can be run directly.
+`[resources].root` is only the host directory for those files. `items` stays empty.
 
 ## Start the Web Server
 

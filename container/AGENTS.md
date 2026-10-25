@@ -8,8 +8,9 @@
   * /home/kali/.local/nuclei-templates
   * /home/kali/pocs
   * /home/kali/tools
+  * /home/kali/tools/ysoserial.jar 是 ysoserial 0.0.6。Java 反序列化直接使用 `java -jar /home/kali/tools/ysoserial.jar`，不要再从网络下载
   * /home/kali/knowledges
-  * /home/kali/.local/bin 中可能挂载了 katana、nuclei、dalfox、cloudfox、kerbrute 等工具，并已在 PATH 中
+  * /home/kali/.local/bin 中挂载了 katana、nuclei、dalfox、cloudfox，并已在 PATH 中
 * level 3 的题目模拟多层网络环境，考验多步攻击规划与权限维持
 * level 4 的题目是基础域渗透，模拟企业核心内网环境的推演，你可能用到这些命令：
     * ls /usr/bin/impacket-*

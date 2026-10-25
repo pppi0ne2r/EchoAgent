@@ -4,19 +4,84 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EchoAgent Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=24" />
+    <link rel="stylesheet" href="/static/styles.css?v=34" />
   </head>
   <body>
     <header class="topbar">
-      <div class="brand">
-        <h1>EchoAgent</h1>
-        <p>CTF / 渗透项目调度控制台</p>
+      <div class="topbar-leading">
+        <div class="brand">
+          <h1>EchoAgent</h1>
+          <p>CTF / 渗透项目调度控制台</p>
+        </div>
+        <nav class="topnav" aria-label="页面">
+          <button id="nav-projects" class="nav-button is-active" type="button">项目</button>
+          <button id="nav-extensions" class="nav-button" type="button">扩展</button>
+          <button id="nav-settings" class="nav-button" type="button">配置</button>
+        </nav>
       </div>
       <div class="topbar-actions">
-        <button id="open-settings" class="ghost-button" type="button">配置</button>
         <div class="status-line" id="connection-status">connecting</div>
       </div>
     </header>
+
+    <section id="extensions-page" class="extensions-page" hidden>
+      <aside class="extension-nav" aria-label="扩展分类">
+        <button class="extension-tab is-active" type="button" data-kind="knowledge">
+          <span>知识库</span>
+          <em data-count>0</em>
+        </button>
+        <button class="extension-tab" type="button" data-kind="tool">
+          <span>工具库</span>
+          <em data-count>0</em>
+        </button>
+        <button class="extension-tab" type="button" data-kind="skill">
+          <span>Skill</span>
+          <em data-count>0</em>
+        </button>
+        <div class="extension-nav-footer">
+          <button id="restart-containers" class="ghost-button" type="button">重启容器</button>
+          <p>普通更新和下载不用重启，已有容器可以直接使用。只有容器缺少新的挂载点时才需要，而且会中断正在运行的任务。</p>
+        </div>
+      </aside>
+      <div class="extension-panels">
+        <section class="extension-column is-active" data-kind="knowledge">
+          <div class="section-header">
+            <h2>知识库</h2>
+            <button class="ghost-button extension-update-all" type="button" data-kind="knowledge">全部更新</button>
+          </div>
+          <p class="extension-note">只填文件直链，不要填名称，也不要填仓库主页。GitHub 用 archive 链接，例如 https://github.com/owner/repo/archive/refs/heads/main.zip。名称自动取仓库名或文件名。已有容器可以直接使用。</p>
+          <form class="extension-form">
+            <input name="url" type="url" placeholder="https://github.com/owner/repo/archive/refs/heads/main.zip" required />
+            <button type="submit">添加</button>
+          </form>
+          <div class="extension-list"></div>
+        </section>
+        <section class="extension-column" data-kind="tool">
+          <div class="section-header">
+            <h2>工具库</h2>
+            <button class="ghost-button extension-update-all" type="button" data-kind="tool">全部更新</button>
+          </div>
+          <p class="extension-note">只填 GitHub 仓库链接，不要填名称，也不要填 release 压缩包。例如 https://github.com/projectdiscovery/katana。名称用仓库名，并下载最新 linux/arm64 资源。已有容器可以直接使用。</p>
+          <form class="extension-form">
+            <input name="url" type="url" placeholder="https://github.com/projectdiscovery/katana" required />
+            <button type="submit">添加</button>
+          </form>
+          <div class="extension-list"></div>
+        </section>
+        <section class="extension-column" data-kind="skill">
+          <div class="section-header">
+            <h2>Skill</h2>
+            <button class="ghost-button extension-update-all" type="button" data-kind="skill">全部更新</button>
+          </div>
+          <p class="extension-note">只填 SKILL.md 或 zip 的直链，不要填名称。例如 https://example.com/java-deser/SKILL.md。名称取上一级目录或文件名，挂到 /home/kali/.agents/skills。已有容器可以直接使用。</p>
+          <form class="extension-form">
+            <input name="url" type="url" placeholder="https://example.com/java-deser/SKILL.md" required />
+            <button type="submit">添加</button>
+          </form>
+          <div class="extension-list"></div>
+        </section>
+      </div>
+    </section>
 
     <main class="layout">
       <aside class="sidebar">
@@ -94,6 +159,7 @@
               <input id="show-detail-logs" type="checkbox" />
               详细
             </label>
+            <button id="export-writeup" type="button" disabled>导出 WP</button>
             <button id="refresh-logs" type="button" disabled>刷新</button>
             <button id="clear-logs" class="danger" type="button" disabled>清空</button>
           </div>
@@ -165,46 +231,62 @@
       </form>
     </dialog>
 
-    <dialog id="settings-dialog">
+    <section id="settings-page" class="settings-page" hidden>
       <form id="settings-form" class="settings-form">
-        <div class="dialog-header">
-          <h2>运行配置</h2>
-          <button id="close-settings" class="ghost-button" type="button">关闭</button>
-        </div>
-        <div class="dialog-body">
-          <p class="settings-note">同时运行几个项目，和每个项目里同时跑几个 Codex，是两个独立限制。一个项目同时执行的 intent 数与它的 Codex 数相同。保存后只影响之后启动的项目；环境变量仍然优先。</p>
-          <label>
-            同时运行的项目数
-            <input name="max_concurrent_projects" type="number" min="1" step="1" required />
-          </label>
-          <label>
-            每个项目同时运行的 Codex 数
-            <input name="codex_max_slots" type="number" min="1" step="1" required />
-          </label>
-          <label>
-            Codex Base URL
-            <input name="base_url" type="url" required />
-          </label>
-          <label>
-            Codex Model
-            <input name="model" type="text" required />
-          </label>
-          <label>
-            Codex API Key
-            <input name="api_key" type="password" autocomplete="off" placeholder="留空表示不修改" />
-          </label>
-          <p id="api-key-hint" class="settings-note"></p>
-          <label class="check-label hint-toggle">
-            <input name="clear_api_key" type="checkbox" />
-            清除已保存的 API Key
-          </label>
-        </div>
-        <div class="dialog-actions">
-          <button type="submit">保存</button>
+        <header class="settings-header">
+          <div>
+            <h2>配置</h2>
+            <p>并发和 Codex。保存后只影响之后启动的项目。</p>
+          </div>
+          <div class="settings-actions">
+            <p id="settings-status" class="settings-status" hidden></p>
+            <button type="submit">保存</button>
+          </div>
+        </header>
+        <div class="settings-body">
+          <section class="settings-card">
+            <header>
+              <h2>并发</h2>
+              <p>两个限制互不影响。一个项目同时执行的 intent 数与 Codex 数相同。</p>
+            </header>
+            <div class="settings-split">
+              <label>
+                同时运行的项目数
+                <input name="max_concurrent_projects" type="number" min="1" step="1" required />
+              </label>
+              <label>
+                每个项目的 Codex 数
+                <input name="codex_max_slots" type="number" min="1" step="1" required />
+              </label>
+            </div>
+          </section>
+          <section class="settings-card">
+            <header>
+              <h2>Codex</h2>
+              <p>接口、模型和密钥。密钥留空表示不修改。</p>
+            </header>
+            <label>
+              Base URL
+              <input name="base_url" type="url" required />
+            </label>
+            <label>
+              模型
+              <input name="model" type="text" required />
+            </label>
+            <label>
+              API Key
+              <input name="api_key" type="password" autocomplete="off" placeholder="留空表示不修改" />
+            </label>
+            <p id="api-key-hint" class="settings-note"></p>
+            <label class="check-label hint-toggle">
+              <input name="clear_api_key" type="checkbox" />
+              清除已保存的 API Key
+            </label>
+          </section>
         </div>
       </form>
-    </dialog>
+    </section>
 
-    <script src="/static/app.js?v=31"></script>
+    <script src="/static/app.js?v=40"></script>
   </body>
 </html>

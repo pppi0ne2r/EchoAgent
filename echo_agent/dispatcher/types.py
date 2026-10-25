@@ -12,6 +12,7 @@ class DispatchMode(str, Enum):
     FIRST_RUN = "first_run"
     EXPLORE = "explore"
     REASON = "reason"
+    WRITEUP = "writeup"
     COMPLETED = "completed"
 
 

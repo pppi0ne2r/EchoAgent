@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 import tarfile
 import urllib.request
@@ -14,8 +16,24 @@ from echo_agent.config import ServerSettings
 from echo_agent.crypto_files import CryptoProjectFiles
 from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, DEFAULT_MEMORY_MB
 from echo_agent.models import Project, ProjectStatus
+from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError, extension_resource
 from echo_agent.server.attachments import CONTAINER_ATTACHMENT_DIR
 from echo_agent.server.project_workspace import CONTAINER_WORK_DIR, ProjectWorkspace
+
+
+
+_EXTENSION_DIRECTORIES = (
+    ("knowledges", "/home/kali/knowledges", False),
+    ("tools", "/home/kali/tools", False),
+    ("skills", "/home/kali/.agents/skills", True),
+    ("pocs", "/home/kali/pocs", False),
+)
+
+
+def _container_path_covered(container_path: str, occupied: set[str]) -> bool:
+    if container_path in occupied:
+        return True
+    return any(container_path.startswith(f"{dest}/") for dest in occupied if dest)
 
 
 class DockerRuntimeError(RuntimeError):
@@ -37,6 +55,7 @@ class DockerProjectRuntime:
     keepalive_command: Sequence[str] = ("sleep", "infinity")
     attachment_root: Path | None = None
     workspace: ProjectWorkspace | None = None
+    extensions: ExtensionCatalog | None = None
 
     @classmethod
     def from_settings(
@@ -79,6 +98,8 @@ class DockerProjectRuntime:
         container = self._container_name(project)
         mounts = list(self._prepare_project_resources(project, log=log))
         mounts.extend(self._project_workspace_mounts(project))
+        mounts.extend(self._extension_directory_mounts(mounts))
+        mounts.extend(self._extension_item_mounts(mounts))
         if self.workspace is None:
             attachment = self._attachment_mount(project)
             if attachment is not None:
@@ -103,6 +124,88 @@ class DockerProjectRuntime:
             self._log(log, "docker container start finished", docker=container)
             return
         self._log(log, "docker container already running", docker=container)
+
+    def prepare_extensions(self, log: DockerLogCallback | None = None) -> list[dict[str, str]]:
+        return self._prepare_extension_items(log=log)
+
+    def update_extensions(
+        self,
+        item_id: str | None = None,
+        kind: str | None = None,
+        log: DockerLogCallback | None = None,
+    ) -> list[dict[str, str]]:
+        return self._prepare_extension_items(item_id=item_id, kind=kind, force=True, log=log)
+
+    def _prepare_extension_items(
+        self,
+        item_id: str | None = None,
+        kind: str | None = None,
+        force: bool = False,
+        log: DockerLogCallback | None = None,
+    ) -> list[dict[str, str]]:
+        catalog = self.extensions
+        if catalog is None:
+            if item_id is not None:
+                raise KeyError(item_id)
+            return []
+        root = Path(self.resource_root)
+        root.mkdir(parents=True, exist_ok=True)
+        matched = False
+        failures: list[dict[str, str]] = []
+        for item, resource in catalog.pairs():
+            if item_id is not None and item.id != item_id:
+                continue
+            if kind is not None and item.kind != kind:
+                continue
+            matched = True
+            host_path = catalog.host_path(resource)
+            if (force or not self._resource_exists(host_path)) and item.github_repo:
+                try:
+                    resource = extension_resource(catalog.refresh_release_url(item.id))
+                except ExtensionResolveError as exc:
+                    if force:
+                        message = str(exc)
+                        catalog.set_error(item.id, message)
+                        failures.append({"id": item.id, "kind": item.kind, "name": item.name, "error": message})
+                        continue
+                    self._log(log, "extension release lookup failed; using saved url", name=item.name, error=str(exc))
+            try:
+                self._prepare_one_resource(root, resource, log=log, force=force)
+            except DockerRuntimeError as exc:
+                message = str(exc)
+                catalog.set_error(item.id, message)
+                failures.append({"id": item.id, "kind": item.kind, "name": item.name, "error": message})
+                continue
+            catalog.set_error(item.id, "")
+        if item_id is not None and not matched:
+            raise KeyError(item_id)
+        return failures
+
+    def recreate_existing_container(self, project: Project, log: DockerLogCallback | None = None) -> bool:
+        container = self._container_name(project)
+        state = self._container_state(container)
+        if state is None:
+            self._log(log, "docker container restart skipped; container was never created", docker=container)
+            return False
+        self._log(log, "docker container restart started", docker=container, previous_state=state)
+        self.remove_project_container(project, log=log)
+        self.ensure_project_container(project, log=log)
+        if state != "running":
+            self.stop_project_container(project, log=log)
+        self._log(log, "docker container restart finished", docker=container, previous_state=state)
+        return True
+
+    def ensure_extension_mounts(self, project: Project, log: DockerLogCallback | None = None) -> None:
+        if self.extensions is None or not self.extensions.list_items():
+            return
+        container = self._container_name(project)
+        if self._container_state(container) is None:
+            return
+        if not self._missing_extension_mounts(container):
+            return
+        self._log(log, "docker container recreate started for extension mounts", docker=container)
+        self.remove_project_container(project, log=log)
+        self.ensure_project_container(project, log=log)
 
     def prepare_shared_resources(self, log: DockerLogCallback | None = None) -> None:
         if not self.resources:
@@ -321,6 +424,89 @@ class DockerProjectRuntime:
             self._log(log, "crypto project files prepared", metadata={"project_id": project.id})
         return mounts
 
+    def _prepare_one_resource(
+        self,
+        root: Path,
+        resource: ProjectResource,
+        log: DockerLogCallback | None = None,
+        force: bool = False,
+    ) -> None:
+        host_path = self._resource_host_path(root, resource)
+        if resource.url:
+            self._download_resource(resource, host_path, log=log, force=force)
+            return
+        host_path.mkdir(parents=True, exist_ok=True)
+
+    def _extension_directory_mounts(
+        self,
+        existing: Sequence[tuple[Path, str, bool]],
+    ) -> list[tuple[Path, str, bool]]:
+        if self.extensions is None:
+            return []
+        occupied = {container.rstrip("/") for _host, container, _read_only in existing}
+        mounts: list[tuple[Path, str, bool]] = []
+        for relative, container, read_only in _EXTENSION_DIRECTORIES:
+            if container in occupied:
+                continue
+            host_path = (self.resource_root / relative).resolve()
+            host_path.mkdir(parents=True, exist_ok=True)
+            mounts.append((host_path, container, read_only))
+            occupied.add(container)
+        return mounts
+
+    def _extension_item_mounts(
+        self,
+        existing: Sequence[tuple[Path, str, bool]],
+    ) -> list[tuple[Path, str, bool]]:
+        if self.extensions is None:
+            return []
+        occupied = {container.rstrip("/") for _host, container, _read_only in existing}
+        mounts: list[tuple[Path, str, bool]] = []
+        for _item, resource in self.extensions.pairs():
+            container = resource.container_path.rstrip("/")
+            if not container or _container_path_covered(container, occupied):
+                continue
+            host_path = self.extensions.host_path(resource)
+            if not self._resource_exists(host_path):
+                continue
+            mounts.append((host_path.resolve(), resource.container_path, resource.read_only))
+            occupied.add(container)
+        return mounts
+
+    def _missing_extension_mounts(self, container: str) -> list[str]:
+        completed = subprocess.run(
+            ["docker", "inspect", "-f", "{{json .Mounts}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return []
+        try:
+            mounts = json.loads(completed.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(mounts, list):
+            return []
+        destinations = {str(item.get("Destination") or "").rstrip("/") for item in mounts if isinstance(item, dict)}
+        expected = [container for _relative, container, _read_only in _EXTENSION_DIRECTORIES]
+        if self.extensions is not None:
+            covered = {path.rstrip("/") for path in expected}
+            for _item, resource in self.extensions.pairs():
+                container = resource.container_path.rstrip("/")
+                if not container or _container_path_covered(container, covered):
+                    continue
+                if not self._resource_exists(self.extensions.host_path(resource)):
+                    continue
+                expected.append(container)
+                covered.add(container)
+        missing: list[str] = []
+        for container_path in expected:
+            if any(container_path == dest or container_path.startswith(f"{dest}/") for dest in destinations if dest):
+                continue
+            missing.append(container_path)
+        return missing
+
     def _prepare_resources_at_root(
         self,
         root: Path,
@@ -360,8 +546,9 @@ class DockerProjectRuntime:
         resource: ProjectResource,
         host_path: Path,
         log: DockerLogCallback | None = None,
+        force: bool = False,
     ) -> None:
-        if self._resource_exists(host_path):
+        if not force and self._resource_exists(host_path):
             self._log(
                 log,
                 "shared resource already exists",
@@ -379,14 +566,18 @@ class DockerProjectRuntime:
             url=resource.url,
             host_path=str(host_path),
             archive=resource.archive,
+            force=force,
         )
         try:
             urllib.request.urlretrieve(str(resource.url), tmp_path)
-            if resource.archive:
+            if resource.archive and not resource.archive_single_file and host_path.is_dir():
+                self._refresh_directory_archive(tmp_path, host_path)
+                tmp_path.unlink()
+            elif resource.archive:
                 self._extract_archive(tmp_path, host_path, single_file=resource.archive_single_file)
                 tmp_path.unlink()
             else:
-                tmp_path.replace(host_path)
+                self._replace_file(tmp_path, host_path)
             if resource.executable:
                 self._chmod_executable(host_path)
         except Exception as exc:
@@ -400,6 +591,33 @@ class DockerProjectRuntime:
             host_path=str(host_path),
             container_path=resource.container_path,
         )
+
+    def _refresh_directory_archive(self, archive_path: Path, host_path: Path) -> None:
+        staging = host_path.with_name(f".{host_path.name}.staging")
+        if staging.exists():
+            shutil.rmtree(staging)
+        self._extract_archive(archive_path, staging, single_file=False)
+        for child in list(host_path.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for child in list(staging.iterdir()):
+            shutil.move(child, host_path / child.name)
+        staging.rmdir()
+
+    @staticmethod
+    def _replace_file(tmp_path: Path, host_path: Path) -> None:
+        if host_path.is_file():
+            host_path.write_bytes(tmp_path.read_bytes())
+            tmp_path.unlink()
+            return
+        if host_path.exists():
+            if host_path.is_dir() and not host_path.is_symlink():
+                shutil.rmtree(host_path)
+            else:
+                host_path.unlink()
+        tmp_path.replace(host_path)
 
     @staticmethod
     def _resource_exists(host_path: Path) -> bool:
@@ -451,17 +669,25 @@ class DockerProjectRuntime:
 
     @staticmethod
     def _extract_single_zip_file(archive: zipfile.ZipFile, names: Sequence[str], host_path: Path) -> None:
-        if not names:
+        infos = [info for info in archive.infolist() if info.filename in names]
+        if not infos:
             raise DockerRuntimeError("archive does not contain any files")
+        wanted = host_path.name
+        exact = [info for info in infos if Path(info.filename).name == wanted]
+        chosen = max(exact or infos, key=lambda info: info.file_size)
         host_path.parent.mkdir(parents=True, exist_ok=True)
-        with archive.open(names[0]) as source, host_path.open("wb") as target:
+        with archive.open(chosen) as source, host_path.open("wb") as target:
             target.write(source.read())
 
     @staticmethod
     def _extract_single_tar_file(archive: tarfile.TarFile, members: Sequence[tarfile.TarInfo], host_path: Path) -> None:
         if not members:
             raise DockerRuntimeError("archive does not contain any files")
-        source = archive.extractfile(members[0])
+        wanted = host_path.name
+        exact = [member for member in members if Path(member.name).name == wanted]
+        members = exact or list(members)
+        member = max(members, key=lambda item: item.size)
+        source = archive.extractfile(member)
         if source is None:
             raise DockerRuntimeError("archive member cannot be extracted")
         host_path.parent.mkdir(parents=True, exist_ok=True)

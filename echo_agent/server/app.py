@@ -35,11 +35,14 @@ from echo_agent.server.schemas import (
     ProjectCreateRequest,
     ProjectDetailsUpdate,
     ProjectLogCreateRequest,
+    ExtensionCreateRequest,
     ProjectRunRequest,
     ProjectSaveRequest,
     ProjectStatusRequest,
 )
 from echo_agent.server.dispatcher_runner import DispatcherRunner
+from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError
+from echo_agent.server.writeup import WriteupService
 from echo_agent.storage import ProjectNotFoundError, ProjectConflictError, SQLiteProjectStore
 
 
@@ -88,13 +91,30 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 setattr(runtime, attribute, value)
             except (AttributeError, TypeError):
                 pass
+    resource_root = getattr(runtime, "resource_root", data_dir / "resources")
+    app.state.extensions = ExtensionCatalog(data_dir / "extensions.json", resource_root)
+    if is_dataclass(runtime) and not isinstance(runtime, type):
+        runtime = replace(runtime, extensions=app.state.extensions)
+    else:
+        try:
+            setattr(runtime, "extensions", app.state.extensions)
+        except (AttributeError, TypeError):
+            pass
     app.state.project_runtime = runtime
     app.state.project_runtime.prepare_shared_resources()
+    prepare_extensions = getattr(app.state.project_runtime, "prepare_extensions", None)
+    if prepare_extensions is not None:
+        prepare_extensions()
     app.state.crypto_service = CryptoProjectService(
         CryptoProjectFiles(store.database_path.parent / "projects"),
         aes_image=getattr(app.state.project_runtime, "image", None),
     )
     app.state.dispatcher_runner = DispatcherRunner(store, runtime=app.state.project_runtime)
+    app.state.writeup_service = WriteupService(
+        store,
+        app.state.workspace,
+        app.state.project_runtime,
+    )
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -624,6 +644,103 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
             return app.state.dispatcher_runner.stop(project_id).to_dict()
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+
+    @app.post("/projects/{project_id}/writeup", status_code=HTTPStatus.ACCEPTED)
+    def start_writeup(project_id: int) -> dict[str, Any]:
+        try:
+            return app.state.writeup_service.start(project_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+
+    @app.get("/projects/{project_id}/writeup")
+    def get_writeup(project_id: int) -> dict[str, Any]:
+        try:
+            return app.state.writeup_service.status(project_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+
+    @app.get("/projects/{project_id}/writeup/download")
+    def download_writeup(project_id: int) -> FileResponse:
+        try:
+            project = app.state.store.get_project(project_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        path = app.state.writeup_service.record_path(project)
+        if not path.is_file() or path.stat().st_size == 0:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="writeup not found")
+        return FileResponse(
+            path,
+            media_type="text/markdown; charset=utf-8",
+            filename=app.state.writeup_service.status(project_id).get("filename") or "wp.md",
+        )
+
+    @app.get("/extensions")
+    def list_extensions() -> list[dict[str, Any]]:
+        return app.state.extensions.public_items(app.state.project_runtime._resource_exists)
+
+    @app.post("/extensions", status_code=HTTPStatus.CREATED)
+    def create_extension(data: ExtensionCreateRequest) -> dict[str, Any]:
+        try:
+            link = data.url.strip() or data.repo.strip()
+            if data.name.strip() and data.kind != "tool":
+                item = app.state.extensions.add(data.kind, data.name, data.url)
+            else:
+                item = app.state.extensions.add_from_link(data.kind, link)
+        except (ValueError, ExtensionResolveError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        return next(entry for entry in app.state.extensions.public_items(app.state.project_runtime._resource_exists) if entry["id"] == item.id)
+
+    @app.post("/extensions/update")
+    def update_extensions(kind: str | None = None) -> dict[str, Any]:
+        if kind is not None and kind not in {"knowledge", "tool", "skill"}:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="kind must be knowledge, tool, or skill")
+        failures = app.state.project_runtime.update_extensions(kind=kind)
+        items = app.state.extensions.public_items(app.state.project_runtime._resource_exists)
+        if failures:
+            detail = "、".join(f"{item['name']}（{item['error']}）" for item in failures)
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=f"扩展更新失败：{detail}")
+        return {"updated": len(items) if kind is None else sum(item["kind"] == kind for item in items), "items": items}
+
+    @app.post("/extensions/{item_id}/update")
+    def update_extension(item_id: str) -> dict[str, Any]:
+        try:
+            failures = app.state.project_runtime.update_extensions(item_id=item_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="extension not found") from exc
+        if failures:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=failures[0]["error"])
+        return next(entry for entry in app.state.extensions.public_items(app.state.project_runtime._resource_exists) if entry["id"] == item_id)
+
+    @app.delete("/extensions/{item_id}")
+    def delete_extension(item_id: str) -> dict[str, Any]:
+        try:
+            app.state.extensions.delete(item_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="extension not found") from exc
+        return {"deleted": item_id}
+
+    @app.post("/containers/restart")
+    def restart_containers() -> dict[str, Any]:
+        stopped = [state.to_dict() for state in app.state.dispatcher_runner.stop_all()]
+        restarted: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for project in app.state.store.list_projects():
+            def log(message: str, level: str = "info", metadata: dict[str, Any] | None = None, project_id: int = project.id) -> None:
+                app.state.store.add_project_log(project_id, message, level=level, metadata=metadata or {})
+
+            try:
+                recreated = app.state.project_runtime.recreate_existing_container(project, log=log)
+            except DockerRuntimeError as exc:
+                failed.append({"id": project.id, "name": project.name, "error": str(exc)})
+                app.state.store.add_project_log(project.id, f"docker container restart failed: {exc}", level="error")
+                continue
+            entry = {"id": project.id, "name": project.name, "docker": project.docker}
+            if recreated:
+                restarted.append(entry)
+            else:
+                skipped.append({**entry, "reason": "not created"})
+        return {"stopped": stopped, "restarted": restarted, "skipped": skipped, "failed": failed}
 
     @app.get("/settings")
     def get_settings() -> dict[str, Any]:

@@ -79,6 +79,7 @@ class DispatcherRunner:
         project = self.store.get_project(project_id)
         if project.status == ProjectStatus.COMPLETED:
             raise ValueError("completed project cannot run")
+        self._ensure_extensions(project_id)
         enqueued = False
         with self._lock:
             existing = self._runs.get(project_id)
@@ -105,6 +106,36 @@ class DispatcherRunner:
             return state
         handle.thread.start()
         return state
+
+    def _ensure_extensions(self, project_id: int) -> None:
+        prepare = getattr(self.runtime, "prepare_extensions", None)
+        if prepare is None:
+            return
+        failures = prepare(
+            log=lambda message, level="info", metadata=None: self.store.add_project_log(
+                project_id,
+                message,
+                level=level,
+                metadata=metadata or {},
+            )
+        )
+        if not failures:
+            refresh = getattr(self.runtime, "ensure_extension_mounts", None)
+            if refresh is not None:
+                refresh(
+                    self.store.get_project(project_id),
+                    log=lambda message, level="info", metadata=None: self.store.add_project_log(
+                        project_id,
+                        message,
+                        level=level,
+                        metadata=metadata or {},
+                    ),
+                )
+            return
+        detail = "、".join(f"{item['name']}（{item['error']}）" for item in failures)
+        message = f"扩展下载失败：{detail}"
+        self.store.add_project_log(project_id, message, level="error")
+        raise ValueError(message)
 
     def start_many(
         self,

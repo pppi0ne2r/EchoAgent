@@ -94,3 +94,10 @@ class ConsoleSettingsUpdate(BaseModel):
     model: str
     api_key: str | None = None
     clear_api_key: bool = False
+
+
+class ExtensionCreateRequest(BaseModel):
+    kind: str
+    name: str = ""
+    url: str = ""
+    repo: str = ""

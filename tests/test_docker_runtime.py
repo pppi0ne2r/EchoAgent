@@ -255,5 +255,70 @@ class DockerProjectRuntimeTests(unittest.TestCase):
 
 
 
+
+
+class StatefulDockerProjectRuntime(RecordingDockerProjectRuntime):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_states", {})
+
+    def _container_state(self, container: str) -> str | None:
+        if container in self._states:
+            return self._states[container]
+        return self._recorded_container_state
+
+    def _run(self, command, log=None, output_prefix: str = "docker") -> None:
+        super()._run(command, log=log, output_prefix=output_prefix)
+        if command[:2] == ["docker", "rm"]:
+            self._states[command[-1]] = None
+        elif command[:3] == ["docker", "run", "-d"]:
+            self._states[command[command.index("--name") + 1]] = "running"
+        elif command[:2] == ["docker", "stop"]:
+            self._states[command[-1]] = "exited"
+
+
+class ContainerRestartTests(unittest.TestCase):
+    def test_recreate_skips_container_that_was_never_created(self) -> None:
+        runtime = StatefulDockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+            image_exists=True,
+            container_state=None,
+        )
+        project = Project(id=7, name="task-7", docker="echo-agent-task-7")
+
+        self.assertFalse(runtime.recreate_existing_container(project))
+        self.assertEqual(runtime.commands, [])
+
+    def test_recreate_running_container_and_stop_previously_stopped_container(self) -> None:
+        runtime = StatefulDockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+            image_exists=True,
+            container_state="running",
+        )
+        running = Project(id=7, name="task-7", docker="echo-agent-task-7")
+        self.assertTrue(runtime.recreate_existing_container(running))
+        self.assertEqual(runtime.commands[0][:3], ["docker", "rm", "-f"])
+        self.assertEqual(runtime.commands[1][:4], ["docker", "run", "-d", "--name"])
+        self.assertEqual(len(runtime.commands), 2)
+
+        stopped = StatefulDockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+            image_exists=True,
+            container_state="exited",
+        )
+        project = Project(id=8, name="task-8", docker="echo-agent-task-8")
+        self.assertTrue(stopped.recreate_existing_container(project))
+        self.assertEqual(stopped.commands[0][:3], ["docker", "rm", "-f"])
+        self.assertEqual(stopped.commands[1][:4], ["docker", "run", "-d", "--name"])
+        self.assertEqual(stopped.commands[2], ["docker", "stop", "echo-agent-task-8"])
+        self.assertEqual(stopped._container_state("echo-agent-task-8"), "exited")
+
+
 if __name__ == "__main__":
     unittest.main()
