@@ -29,8 +29,10 @@ _REASON_INTENT_EXAMPLE = json.dumps(
     ensure_ascii=False,
 )
 _WORKER_RESULT_RULES = (
-    "一旦确认了新事实，或确认某条路径已经关闭，立刻输出 JSON，不要继续扩大扫描。",
+    "未拿到 flag 时，每确认一个独立的新事实，或确认某条路径已经关闭，就输出一条 JSON，不要继续扩大扫描。",
+    "未拿到 flag 时不要在结束时再输出重复的总结。",
     "已关闭或失败的路径必须使用 outcome=refuted，不要把否定结论写成 verified。",
+    "拿到 flag 时，本次执行只能输出一条 JSON，不要在它之前或之后再输出其他 JSON。",
 )
 
 # Shared by all crypto modes: carry a reproducible method across intents,
@@ -100,19 +102,17 @@ class PromptBuilder:
             [
                 "你是一个 CTF/渗透测试题目的执行 agent，当前模式是 first_run。",
                 "这是项目第一次执行。你的任务是先尝试直接解决题目并得到 flag。",
-                "如果能够得到 flag，返回 answer；如果不能得到 flag，只总结一个对后续探索最有价值的新事实 fact_description。",
+                "如果能够得到 flag，本次执行只输出一条 JSON：answer 写完整 flag，fact_description 写利用路径和关键证据，正文必须包含与 answer 相同的 flag，outcome 为 verified。",
+                "如果不能得到 flag，每个独立事实各输出一条 JSON，answer 必须为 null。可以输出多条。新事实使用 outcome=verified，已关闭方向使用 outcome=refuted。",
                 "不要规划后续 intent。后续 intent 由 reason 模式在下一轮循环中规划。",
                 "你运行在该项目对应的 Kali Docker 容器中，可以使用容器内工具完成快速验证、扫描、利用和取证。",
-                "每确认一个关键事实，就立即输出一个 JSON 对象；同一次执行可以输出多个 JSON，结束时再输出最后一个总结。",
-                "这样即使执行被超时打断，已经确认的事实也不会丢失。",
-                "不要长时间等待无输出命令；如果某个命令持续运行或输出为空，应立即停止等待并把当前可确认的信息总结为 fact_description。",
-                "如果已经得到 HTTP 状态、源码片段、目录枚举结果或命令超时信息，应立即输出 JSON 总结事实，不要继续扩大字典或扩展名猜测。",
+                "不要长时间等待无输出命令；如果某个命令持续运行或输出为空，应立即停止等待，并把当前可确认的信息写入 fact_description。",
                 "除非已经明确拿到 flag，否则不要因为单个命令卡住而继续等待。",
                 *_WORKER_RESULT_RULES,
-                "输出内容只能是 JSON 对象，不要输出 Markdown 或额外解释；允许在执行过程中多次输出。",
+                "输出内容只能是 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
                 "JSON 格式：",
-                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null, "outcome": "verified"}',
+                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": "写入你实际验证得到的具体事实；不要照抄本句", "outcome": "verified"}',
                 '{"answer": null, "fact_description": "写入你实际验证得到的具体事实；不要照抄本句", "outcome": "verified"}',
                 '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}',
                 "",
@@ -131,19 +131,17 @@ class PromptBuilder:
                 "你是一个 CTF/渗透测试题目的执行 agent，当前模式是 explore。",
                 "你的任务是只执行给定 intent，不要规划新的 intent。",
                 "你运行在该项目对应的 Kali Docker 容器中，可以使用容器内工具完成验证、扫描、利用和取证。",
-                "每确认一个关键事实，就立即输出一个 JSON 对象；同一次执行可以输出多个 JSON，结束时再输出最后一个总结。",
-                "这样即使执行被超时打断，已经确认的事实也不会丢失。",
-                "不要长时间等待无输出命令；如果某个命令持续运行或输出为空，应立即停止等待并把当前可确认的信息总结为 fact_description。",
-                "如果已经得到 HTTP 状态、源码片段、目录枚举结果或命令超时信息，应立即输出 JSON 总结事实，不要继续扩大字典或扩展名猜测。",
+                "如果直接得到 flag，本次执行只输出一条 JSON：answer 写完整 flag，fact_description 写利用路径和关键证据，正文必须包含与 answer 相同的 flag，outcome 为 verified。不要再输出其他 JSON。",
+                "如果不能得到 flag，每个独立事实各输出一条 JSON，answer 必须为 null。可以输出多条。不要输出额外总结。",
+                "不要长时间等待无输出命令；如果某个命令持续运行或输出为空，应立即停止等待，并把当前可确认的信息写入 fact_description。",
                 "除非已经明确拿到 flag，否则不要因为单个命令卡住而继续等待。",
-                "如果直接得到 flag 或最终答案，返回 answer；否则总结本次执行得到的新事实 fact_description。",
                 *_WORKER_RESULT_RULES,
-                "输出内容只能是 JSON 对象，不要输出 Markdown 或额外解释；允许在执行过程中多次输出。",
+                "输出内容只能是 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
                 "JSON 格式：",
+                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": "写入你本次 intent 实际验证得到的具体事实；不要照抄本句", "outcome": "verified"}',
                 '{"answer": null, "fact_description": "写入你本次 intent 实际验证得到的具体事实；不要照抄本句", "outcome": "verified"}',
                 '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}',
-                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null, "outcome": "verified"}',
                 "",
                 _format_worker_context(project),
                 "",
@@ -302,8 +300,9 @@ def _format_worker_context(project: Project) -> str:
     return "\n".join(
         [
             "执行上下文只包含任务信息、已验证证据和已经关闭的动作。",
-            "closed_actions 给出已执行动作；密码任务另附 intent id 和结构化参数，不包含证伪事实编号。" if project.task_type == "crypto" else "closed_actions 只给出 action_key、description、outcome，不包含证伪事实编号。",
-            "不要在相同输入、参数和范围内重做 closed_actions；不同范围须明确写出新边界。" if project.task_type == "crypto" else "不要重做 closed_actions 里的动作，也不要根据缺失的事实编号继续扩展。",
+            "target_url 可以同时包含 URL、IP 和容器内附件路径，不要假定它一定是网页地址。",
+            "closed_actions 只给出 action_key、description、outcome，不包含证伪事实编号。",
+            "不要重做 closed_actions 里的动作，也不要根据缺失的事实编号继续扩展。",
             json.dumps(payload, ensure_ascii=False, indent=2),
         ]
     )
@@ -388,6 +387,7 @@ def _format_project_context(project: Project) -> str:
     return "\n".join(
         [
             "项目上下文分为已知证据、证伪结论、已经做过的动作、不要重复的失败路径、终点说明。",
+            "target_url 可以同时包含 URL、IP 和容器内附件路径，不要假定它一定是网页地址。",
             "evidence 才是已验证事实。新 intent 的 from 只能取 allowed_from。",
             "evidence 为空时，allowed_from 只包含起点，避免没有证据时无法继续规划。",
             "findings 是证伪或错误事实的正文。不能作为 from，也不能换一种说法重做。",
@@ -443,9 +443,15 @@ def _executed_intents(project: Project) -> list[Intent]:
 
 
 def _intent_result(project: Project, intent: Intent) -> tuple[str, str]:
-    if intent.to_fact_id is None:
+    fact_ids = [fact_id for fact_id in intent.to_fact_ids if fact_id in project.facts]
+    if not fact_ids and intent.to_fact_id in project.facts:
+        fact_ids = [intent.to_fact_id]
+    selected = [project.facts[fact_id] for fact_id in fact_ids if project.facts[fact_id].kind != FactKind.GOAL]
+    if not selected and fact_ids:
+        fact = project.facts[fact_ids[-1]]
+        return fact.description, fact.kind.value
+    if not selected:
         return "", ""
-    fact = project.facts.get(intent.to_fact_id)
-    if fact is None:
-        return "", ""
-    return fact.description, fact.kind.value
+    primary = project.facts.get(intent.to_fact_id)
+    kind = primary.kind.value if primary is not None and primary in selected else selected[-1].kind.value
+    return "\n".join(fact.description for fact in selected), kind

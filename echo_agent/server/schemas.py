@@ -18,6 +18,13 @@ class ProjectCreateRequest(BaseModel):
     crypto: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectDetailsUpdate(BaseModel):
+    name: str
+    target_url: str | None = None
+    hint: str = ""
+    objective: str = ""
+
+
 class ProjectSaveRequest(BaseModel):
     id: int | None = None
     name: str
@@ -67,6 +74,23 @@ class ProjectLogCreateRequest(BaseModel):
 
 
 class ProjectRunRequest(BaseModel):
-    interval_seconds: float = 3.0
+    interval_seconds: float | None = None
     max_steps: int | None = None
-    max_workers: int = 4
+    max_workers: int | None = None
+
+
+class ProjectBatchRunRequest(BaseModel):
+    project_ids: list[int] | None = None
+    interval_seconds: float | None = None
+    max_steps: int | None = None
+    max_workers: int | None = None
+
+
+class ConsoleSettingsUpdate(BaseModel):
+    max_concurrent_projects: int = Field(ge=1)
+    codex_max_slots: int = Field(ge=1)
+    explore_max_workers: int = Field(ge=1)
+    base_url: str
+    model: str
+    api_key: str | None = None
+    clear_api_key: bool = False

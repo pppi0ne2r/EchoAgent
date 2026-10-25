@@ -229,6 +229,8 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         self.assertEqual(len(branch_intents), 2)
         self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
         self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+        planned = next(log for log in client.logs if str(log["message"]).startswith("reason planned"))
+        self.assertEqual(planned["metadata"]["intent_ids"], [intent.id for intent in branch_intents])
 
     def test_reason_creates_next_intents_after_first_run_fact(self) -> None:
         project = Project(
@@ -408,14 +410,46 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         self.assertEqual(result.mode, DispatchMode.COMPLETED)
         self.assertEqual(client.project.facts[1].description, "result\nanswer: flag{graph}")
-        answer_edges = [
+        self.assertEqual(len(client.project.intents), 1)
+        producer = client.project.intents[seed_intent.id]
+        self.assertEqual(producer.to_fact_ids, (2, 1))
+        self.assertEqual(producer.to_fact_id, 2)
+        self.assertFalse(
+            any(intent.description == "确认该事实包含最终答案" for intent in client.project.intents.values())
+        )
+
+    def test_initial_probe_intent_is_not_reused_for_final_result(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("HTTP response contained flag{graph}", fact_id=2)
+        project.add_fact("agent reported possible final answer: flag{graph}", fact_id=3)
+        seed = project.add_intent(Dispatcher._INITIAL_PROBE_DESCRIPTION, from_fact_id=0, to_fact_id=1)
+        seed.mark_running()
+        seed.mark_completed(to_fact_ids=(2, 3), to_fact_id=3)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("flag{graph}"),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        saved = client.project
+        self.assertEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(saved.facts[1].description, "result\nanswer: flag{graph}")
+        probe = saved.intents[seed.id]
+        self.assertEqual(probe.to_fact_ids, (2, 3))
+        self.assertNotIn(1, probe.to_fact_ids)
+        goal_edges = [
             intent
-            for intent in client.project.intents.values()
-            if intent.from_fact_id == 2 and intent.to_fact_id == 1
+            for intent in saved.intents.values()
+            if intent.id != seed.id and intent.from_fact_id == 2 and 1 in intent.to_fact_ids
         ]
-        self.assertEqual(len(answer_edges), 1)
-        self.assertEqual(answer_edges[0].description, "确认该事实包含最终答案")
-        self.assertTrue(answer_edges[0].is_completed)
+        self.assertEqual(len(goal_edges), 1)
+        self.assertEqual(goal_edges[0].description, "得到最终结果")
+        self.assertTrue(goal_edges[0].is_completed)
 
     def test_reason_answer_does_not_create_goal_edge_without_source_fact(self) -> None:
         project = self._project_ready_for_reason()
@@ -1098,6 +1132,80 @@ class GraphContractTests(unittest.TestCase):
         self.assertEqual(project.facts[3].kind, FactKind.REFUTED)
         self.assertEqual(intent.outcome, IntentOutcome.REFUTED)
         self.assertEqual(intent.to_fact_id, 3)
+        self.assertEqual(intent.to_fact_ids, (2, 3))
+        self.assertEqual(len(project.intents), 1)
+        self.assertNotIn(1, intent.to_fact_ids)
+
+    def test_answer_only_json_does_not_duplicate_fact_that_already_contains_flag(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("初始探测", from_fact_id=0, to_fact_id=1)
+        intent.mark_running()
+        result = WorkerResult(
+            answer="flag{ok}",
+            outcome="verified",
+            prior_results=[
+                WorkerObservation(
+                    fact_description="利用路径得到 flag{ok}",
+                    outcome="verified",
+                )
+            ],
+        )
+
+        Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
+
+        self.assertEqual([fact.description for fact in project.facts.values() if fact.id >= 2], ["利用路径得到 flag{ok}"])
+        self.assertNotIn("agent reported possible final answer", project.facts[2].description)
+        self.assertEqual(intent.outcome, IntentOutcome.VERIFIED)
+        self.assertEqual(intent.to_fact_ids, (2,))
+
+    def test_answer_only_prior_is_dropped_when_final_fact_contains_flag(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("初始探测", from_fact_id=0, to_fact_id=1)
+        intent.mark_running()
+        result = WorkerResult(
+            fact_description="利用路径得到 flag{ok}",
+            outcome="verified",
+            answer="flag{ok}",
+            prior_results=[
+                WorkerObservation(answer="flag{ok}", outcome="verified"),
+            ],
+        )
+
+        Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
+
+        descriptions = [fact.description for fact in project.facts.values() if fact.id >= 2]
+        self.assertEqual(descriptions, ["利用路径得到 flag{ok}"])
+        self.assertEqual(intent.to_fact_ids, (2,))
+
+    def test_multiple_targets_round_trip_through_storage(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from echo_agent.storage import SQLiteProjectStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            project = store.create_project(name="round", objective="get flag", target_url="http://target")
+            intent = project.add_intent("probe", from_fact_id=0, to_fact_id=1)
+            first = project.add_fact("first finding")
+            second = project.add_fact("second finding")
+            intent.mark_running()
+            intent.mark_completed(to_fact_id=second.id, outcome=IntentOutcome.VERIFIED)
+            intent.set_targets([first.id, second.id])
+            intent.add_target(1)
+            store.save_project(project)
+
+            loaded = store.get_project(project.id)
+            saved = loaded.intents[intent.id]
+            self.assertEqual(saved.to_fact_ids, (first.id, second.id, 1))
+            self.assertEqual(saved.to_fact_id, second.id)
+            restored = Project.from_dict(loaded.to_dict())
+            self.assertEqual(restored.intents[intent.id].to_fact_ids, (first.id, second.id, 1))
+            self.assertEqual(restored.intents[intent.id].to_fact_id, second.id)
 
     def test_timeout_tail_is_kept_on_the_failure_note(self) -> None:
         note = Dispatcher._execution_failed_fact(
@@ -1492,6 +1600,71 @@ class OuterLoopFixTests(unittest.TestCase):
 
         self.assertTrue(any(log["message"] == "project entered explore mode" for log in client.logs))
 
+    def test_explore_log_records_started_intents_and_new_fact_ids(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("探测首页", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+
+        class MultiFactWorker:
+            def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+                return WorkerResult(
+                    fact_description="首页存在上传点",
+                    prior_results=[WorkerObservation(fact_description="响应头包含 Server")],
+                )
+
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=MultiFactWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        started = next(log for log in client.logs if log["message"].startswith("explore started"))
+        finished = next(log for log in client.logs if log["message"] == "explore intent 0 finished")
+        self.assertEqual(started["metadata"]["intent_ids"], [0])
+        self.assertEqual(finished["metadata"]["fact_ids"], [2, 3])
+
+    def test_first_run_log_records_created_fact_ids(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("首页返回 200"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        started = next(log for log in client.logs if log["message"] == "first-run initial intent started")
+        finished = next(log for log in client.logs if log["message"] == "first-run finished")
+        self.assertEqual(started["metadata"]["intent_id"], 0)
+        self.assertEqual(finished["metadata"]["fact_ids"], [2])
+
+    def test_completion_log_includes_answer(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("HTTP response contained flag{graph}", fact_id=2)
+        seed_intent = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed_intent.mark_running()
+        seed_intent.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("flag{graph}"),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        completed = next(log for log in client.logs if log["message"] == "reason marked project completed")
+        self.assertEqual(completed["metadata"]["answer"], "flag{graph}")
+
     def test_target_not_found_three_times_skips(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
         project.add_fact("start", fact_id=0)
@@ -1552,7 +1725,7 @@ class OuterLoopFixTests(unittest.TestCase):
         self.assertNotIn('"do_not_repeat"', prompt)
         self.assertNotIn('"id": 3', prompt)
         self.assertIn("发现上传点", prompt)
-        self.assertIn("立刻输出 JSON", prompt)
+        self.assertIn("就输出一条 JSON", prompt)
         self.assertIn("outcome=refuted", prompt)
         self.assertIn("检查上传点", prompt)
 

@@ -233,5 +233,27 @@ class DockerProjectRuntimeTests(unittest.TestCase):
                 runtime._container_state("echo-agent")
 
 
+    def test_attachment_directory_is_mounted_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attachment = root / "7"
+            attachment.mkdir()
+            (attachment / "challenge.bin").write_bytes(b"bin")
+            runtime = RecordingDockerProjectRuntime(
+                image="worker:test",
+                context=Path("container"),
+                dockerfile=Path("container/Dockerfile"),
+                image_exists=True,
+                attachment_root=root,
+            )
+            project = Project(id=7, name="rev", docker="echo-agent-task-7")
+
+            runtime.ensure_project_container(project)
+
+            command = " ".join(runtime.commands[-1])
+            self.assertIn(f"{attachment.resolve()}:/home/kali/attachments:ro", command)
+
+
+
 if __name__ == "__main__":
     unittest.main()

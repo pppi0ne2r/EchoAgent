@@ -5,8 +5,7 @@ import hashlib
 import re
 import tempfile
 import time
-from datetime import datetime, timezone
-from uuid import uuid4
+from dataclasses import replace
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -14,18 +13,19 @@ from typing import Any
 import uvicorn
 from starlette.requests import Request
 
-from echo_agent.models import FactKind, Project, ProjectStatus
-from echo_agent.crypto_contract import artifact_ref, input_ref, project_crypto
-from echo_agent.crypto_files import CryptoProjectFiles, MAX_INPUT_BYTES, safe_input_filename
-from echo_agent.crypto_service import CryptoProjectService
-from echo_agent.crypto_verification import VerificationBusy
-from echo_agent.crypto_verify import candidate_digest, goal_sha256
+from echo_agent.config import DispatcherSettings
+from echo_agent.console_settings import public_dispatcher_settings, save_console_settings
+from echo_agent.models import Project, ProjectStatus
+from echo_agent.server.attachments import MAX_ATTACHMENT_BYTES
+from echo_agent.server.project_workspace import ProjectWorkspace
 from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
 from echo_agent.server.schemas import (
-    AcceptanceRequest,
+    ConsoleSettingsUpdate,
     FactCreateRequest,
     IntentCreateRequest,
+    ProjectBatchRunRequest,
     ProjectCreateRequest,
+    ProjectDetailsUpdate,
     ProjectLogCreateRequest,
     ProjectRunRequest,
     ProjectSaveRequest,
@@ -41,9 +41,10 @@ class MissingServerDependencyError(RuntimeError):
 
 def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import FileResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
+        globals()["Request"] = Request
     except ModuleNotFoundError as exc:
         raise MissingServerDependencyError(
             "FastAPI is required to run the server. Install dependencies with: "
@@ -55,8 +56,17 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     async def project_conflict(request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=HTTPStatus.CONFLICT)
     app.state.store = store
-    app.state.project_runtime = DockerProjectRuntime.from_settings(
-        project_data_root=store.database_path.parent / "projects"
+    data_dir = Path(store.database_path).parent
+    app.state.attachment_root = data_dir / "uploads"
+    app.state.workspace = ProjectWorkspace(data_dir / "workspace", legacy_uploads=app.state.attachment_root)
+    app.state.workspace.bind_store(store)
+    app.state.workspace.ensure_projects(store.list_projects())
+    app.state.workspace.backfill_logs(store)
+    store.refresh_boundary_facts()
+    app.state.project_runtime = replace(
+        DockerProjectRuntime.from_settings(),
+        attachment_root=app.state.attachment_root,
+        workspace=app.state.workspace,
     )
     app.state.project_runtime.prepare_shared_resources()
     app.state.crypto_service = CryptoProjectService(
@@ -143,8 +153,92 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 task_type=data.task_type,
                 crypto=data.crypto,
             )
+            app.state.workspace.write_record(project)
             return project.to_dict()
         except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.put("/projects/{project_id}/attachment")
+    async def upload_project_attachment(project_id: int, request: Request, name: str = "") -> dict[str, Any]:
+        try:
+            project = app.state.store.get_project(project_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        if project.status != ProjectStatus.INACTIVE:
+            raise HTTPException(status_code=HTTPStatus.CONFLICT, detail="只能在项目启动前上传附件")
+        filename = name.strip()
+        if not filename:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="缺少附件文件名")
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                announced = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="附件大小无效") from exc
+            if announced > MAX_ATTACHMENT_BYTES:
+                raise HTTPException(status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE, detail="附件不能超过 128MB")
+        content = await request.body()
+        try:
+            _host_path, container_path = app.state.workspace.save_upload(project, filename, content)
+            project = app.state.store.set_project_target(project_id, container_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        return project.to_dict()
+
+    @app.get("/projects/runs")
+    def list_project_runs() -> list[dict[str, Any]]:
+        return [state.to_dict() for state in app.state.dispatcher_runner.list_states()]
+
+    @app.post("/projects/runs", status_code=HTTPStatus.ACCEPTED)
+    def start_project_runs(data: ProjectBatchRunRequest) -> dict[str, Any]:
+        interval_seconds, max_workers = _run_limits(data.interval_seconds, data.max_workers)
+        project_ids = data.project_ids
+        if not project_ids:
+            project_ids = [
+                project.id
+                for project in app.state.store.list_projects()
+                if project.status != ProjectStatus.COMPLETED
+            ]
+        runs: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for project_id in project_ids:
+            try:
+                runs.append(
+                    app.state.dispatcher_runner.start(
+                        project_id,
+                        interval_seconds=interval_seconds,
+                        max_steps=data.max_steps,
+                        max_workers=max_workers,
+                    ).to_dict()
+                )
+            except ProjectNotFoundError:
+                errors.append({"project_id": project_id, "detail": "project not found"})
+            except ValueError as exc:
+                errors.append({"project_id": project_id, "detail": str(exc)})
+        return {"runs": runs, "errors": errors}
+
+    @app.delete("/projects/runs")
+    def stop_project_runs() -> dict[str, Any]:
+        return {"runs": [state.to_dict() for state in app.state.dispatcher_runner.stop_all()]}
+
+    @app.patch("/projects/{project_id}/details")
+    def update_project_details(project_id: int, data: ProjectDetailsUpdate) -> dict[str, Any]:
+        try:
+            run_state = app.state.dispatcher_runner.status(project_id)
+            if run_state.running or run_state.queued:
+                raise HTTPException(status_code=HTTPStatus.CONFLICT, detail="项目正在运行或排队，请先停止后再编辑")
+            project = app.state.store.update_project_details(
+                project_id,
+                name=data.name,
+                target_url=data.target_url,
+                hint=data.hint,
+                objective=data.objective,
+            )
+            app.state.workspace.prune_attachments(project)
+            return project.to_dict()
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        except ValueError as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
     @app.get("/projects/{project_id}")
@@ -157,7 +251,19 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     @app.get("/projects/{project_id}/facts/{fact_id}")
     def get_project_fact(project_id: int, fact_id: int) -> dict[str, Any]:
         try:
+            run_state = app.state.dispatcher_runner.status(project_id)
+            if run_state.queued:
+                app.state.dispatcher_runner.stop(project_id)
+            elif run_state.running:
+                raise HTTPException(
+                    status_code=HTTPStatus.CONFLICT,
+                    detail="project dispatcher is running; stop it before deleting the project",
+                )
             project = app.state.store.get_project(project_id)
+            app.state.project_runtime.remove_project_container(project)
+            deleted = app.state.store.delete_project(project_id).to_dict()
+            app.state.workspace.remove(project_id)
+            return deleted
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
         fact = project.facts.get(fact_id)
@@ -446,9 +552,9 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
 
     @app.get("/projects/{project_id}/logs")
-    def list_project_logs(project_id: int, limit: int = 200) -> list[dict[str, Any]]:
+    def list_project_logs(project_id: int, limit: int = 200, after_id: int = 0) -> list[dict[str, Any]]:
         try:
-            return app.state.store.list_project_logs(project_id, limit=limit)
+            return app.state.store.list_project_logs(project_id, limit=limit, after_id=max(0, after_id))
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
 
@@ -484,11 +590,12 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     @app.post("/projects/{project_id}/run", status_code=HTTPStatus.ACCEPTED)
     def start_project_run(project_id: int, data: ProjectRunRequest) -> dict[str, Any]:
         try:
+            interval_seconds, max_workers = _run_limits(data.interval_seconds, data.max_workers)
             return app.state.dispatcher_runner.start(
                 project_id,
-                interval_seconds=data.interval_seconds,
+                interval_seconds=interval_seconds,
                 max_steps=data.max_steps,
-                max_workers=data.max_workers,
+                max_workers=max_workers,
             ).to_dict()
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
@@ -503,7 +610,42 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
 
+    @app.get("/settings")
+    def get_settings() -> dict[str, Any]:
+        try:
+            return public_dispatcher_settings()
+        except ValueError as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.put("/settings")
+    def put_settings(data: ConsoleSettingsUpdate) -> dict[str, Any]:
+        try:
+            saved = save_console_settings(
+                max_concurrent_projects=data.max_concurrent_projects,
+                codex_max_slots=data.codex_max_slots,
+                explore_max_workers=data.explore_max_workers,
+                base_url=data.base_url,
+                model=data.model,
+                api_key=data.api_key,
+                clear_api_key=data.clear_api_key,
+            )
+            app.state.dispatcher_runner._promote()
+            return saved
+        except ValueError as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
     return app
+
+
+def _run_limits(interval_seconds: float | None, max_workers: int | None) -> tuple[float, int]:
+    settings = DispatcherSettings.from_env()
+    interval = settings.interval_seconds if interval_seconds is None else interval_seconds
+    workers = settings.explore_max_workers if max_workers is None else max_workers
+    if interval < 0:
+        raise ValueError("interval_seconds must be non-negative")
+    if workers < 1:
+        raise ValueError("max_workers must be at least 1")
+    return interval, workers
 
 
 class UvicornServerHandle:

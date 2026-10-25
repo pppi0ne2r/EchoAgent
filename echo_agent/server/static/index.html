@@ -4,113 +4,43 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EchoAgent Console</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=24" />
   </head>
   <body>
     <header class="topbar">
-      <div>
+      <div class="brand">
         <h1>EchoAgent</h1>
         <p>CTF / 渗透项目调度控制台</p>
       </div>
-      <div class="status-line" id="connection-status">connecting</div>
+      <div class="topbar-actions">
+        <button id="open-settings" class="ghost-button" type="button">配置</button>
+        <div class="status-line" id="connection-status">connecting</div>
+      </div>
     </header>
 
     <main class="layout">
       <aside class="sidebar">
-        <section class="section">
-          <h2>创建项目</h2>
-          <form id="create-project-form" class="project-form">
-            <label>
-              任务类型
-              <select name="task_type" id="create-task-type">
-                <option value="general">Web / 渗透</option>
-                <option value="crypto">密码学（离线）</option>
-              </select>
-            </label>
-            <label id="target-url-field">
-              目标 URL
-              <input name="target_url" type="url" placeholder="https://target.example" required />
-            </label>
-            <div id="crypto-files-field" class="crypto-files-field" hidden>
-              <label>密码题完成目标
-                <select name="answer_kind">
-                  <option value="plaintext">恢复明文 / flag</option>
-                  <option value="factors">求 RSA 因子</option>
-                  <option value="private_exponent">求 RSA 私钥指数</option>
-                </select>
-              </label>
-              <label>解的要求
-                <select name="solution_policy"><option value="unique">需要唯一解</option><option value="any">任意一个有效解即可</option></select>
-              </label>
-              <label>最终答案表示
-                <select name="answer_encoding"><option value="">默认（RSA 十进制 / AES UTF-8）</option><option value="decimal">十进制</option><option value="utf8">UTF-8 文本 / flag</option><option value="hex">十六进制字节</option></select>
-              </label>
-              <label>答案形态
-                <select name="answer_form"><option value="">明文/原样（题面直接要 flag 或明文）</option><option value="hash">哈希（题面要明文的 md5/sha1/sha256 等）</option></select>
-              </label>
-              <label>哈希算法（答案形态为哈希时必填）
-                <select name="answer_hash"><option value="">未指定</option><option value="md5">md5</option><option value="sha1">sha1</option><option value="sha224">sha224</option><option value="sha256">sha256</option><option value="sha384">sha384</option><option value="sha512">sha512</option><option value="sha3_256">sha3_256</option><option value="sha3_512">sha3_512</option><option value="blake2b">blake2b</option><option value="blake2s">blake2s</option></select>
-              </label>
-              <label>最终明文字节数（需要保留前导零时填写）
-                <input name="answer_byte_length" type="number" min="1" max="4096" step="1" placeholder="未指定" />
-              </label>
-              <label>RSA 明文字节序
-                <select name="answer_byte_order"><option value="">默认大端</option><option value="big">大端</option><option value="little">小端</option></select>
-              </label>
-              <label>输入文件（可多选，单文件上限 32 MiB）
-                <input name="input_files" type="file" multiple />
-              </label>
-              <label>文件角色
-                <select name="input_role">
-                  <option value="input">原始输入</option>
-                  <option value="source">源码</option>
-                  <option value="parameters">参数</option>
-                  <option value="ciphertext">密文</option>
-                </select>
-              </label>
-              <label>数值基数（如适用）
-                <select name="number_radix"><option value="">未指定</option><option value="10">十进制</option><option value="16">十六进制</option></select>
-              </label>
-              <label>字节顺序（如适用）
-                <select name="byte_order"><option value="">未指定</option><option value="big">大端</option><option value="little">小端</option></select>
-              </label>
-              <label>字节长度（如适用）
-                <input name="byte_length" type="number" min="0" step="1" placeholder="未指定" />
-              </label>
-            </div>
-            <label>
-              Hint
-              <textarea name="hint" rows="3" placeholder="题目提示、范围或账号信息"></textarea>
-            </label>
-            <label>
-              需要完成的工作
-              <textarea name="objective" rows="4" placeholder="例如：找到目标系统 flag 并说明利用路径" required></textarea>
-            </label>
-            <button type="submit">创建</button>
-          </form>
-        </section>
-
-        <section class="section">
-          <div class="section-header">
-            <h2>项目</h2>
-            <button id="refresh-projects" type="button">刷新</button>
+        <div class="section-header">
+          <h2>项目</h2>
+          <div class="sidebar-actions">
+            <button id="open-create" type="button">新建</button>
+            <button id="stop-all" class="danger ghost-stop" type="button">全部停止</button>
           </div>
-          <div id="project-list" class="project-list"></div>
-        </section>
+        </div>
+        <div id="project-list" class="project-list"></div>
       </aside>
 
       <section class="workspace">
         <div class="project-header">
-          <div>
+          <div class="project-heading">
             <h2 id="project-title">选择项目</h2>
-          <p id="project-subtitle">查看任务输入、fact / intent 图和运行状态</p>
+            <p id="project-subtitle">查看任务输入、fact / intent 图和运行状态</p>
           </div>
           <div class="actions">
-            <button id="activate-project" type="button" disabled>激活</button>
+            <button id="edit-project" type="button" disabled>编辑</button>
             <button id="run-project" type="button" disabled>运行</button>
             <button id="stop-project" type="button" disabled>停止</button>
             <button id="delete-project" class="danger" type="button" disabled>删除</button>
-            <button id="refresh-current" type="button" disabled>刷新当前</button>
           </div>
         </div>
 
@@ -118,7 +48,6 @@
           <div><span>状态</span><strong>-</strong></div>
           <div><span>目标</span><strong>-</strong></div>
           <div><span>图</span><strong>-</strong></div>
-          <div><span>Docker</span><strong>-</strong></div>
           <div><span>调度</span><strong>-</strong></div>
         </div>
         <div id="crypto-inputs" class="crypto-inputs" hidden>
@@ -150,13 +79,6 @@
         </div>
 
         <div class="graph-shell">
-          <div class="graph-toolbar" aria-label="图缩放控制">
-            <button id="graph-zoom-out" type="button">缩小</button>
-            <button id="graph-zoom-in" type="button">放大</button>
-            <button id="graph-zoom-fit" type="button">适配</button>
-            <button id="graph-zoom-reset" type="button">重置</button>
-            <span><em>Ctrl+滚轮缩放</em> · <strong id="graph-zoom-label">100%</strong></span>
-          </div>
           <div id="graph-viewport" class="graph-viewport">
             <svg id="project-graph" viewBox="0 0 900 520" role="img" aria-label="项目图"></svg>
           </div>
@@ -166,16 +88,123 @@
 
       <aside class="logs-panel">
         <div class="section-header">
-          <h2>关键日志</h2>
+          <h2>日志</h2>
           <div class="actions">
+            <label class="log-filter" title="显示 Codex 详细输出">
+              <input id="show-detail-logs" type="checkbox" />
+              详细
+            </label>
             <button id="refresh-logs" type="button" disabled>刷新</button>
             <button id="clear-logs" class="danger" type="button" disabled>清空</button>
           </div>
         </div>
+        <div id="run-status-bar" class="run-status-bar">未选择项目</div>
         <div id="log-list" class="log-list"></div>
       </aside>
     </main>
 
-    <script src="/static/app.js"></script>
+    <dialog id="create-dialog">
+      <form id="create-project-form" class="project-form" novalidate>
+        <div class="dialog-header">
+          <h2 id="create-dialog-title">创建项目</h2>
+          <button id="close-create" class="ghost-button" type="button">关闭</button>
+        </div>
+        <div class="dialog-body">
+          <label>
+            项目名称
+            <input name="name" type="text" maxlength="80" placeholder="例如：web-easy、pwn-heap" required />
+          </label>
+          <fieldset class="choice-group">
+            <legend>目标</legend>
+            <div class="choice-row">
+              <label class="check-label"><input name="use_url" type="checkbox" /> URL</label>
+              <label class="check-label"><input name="use_ip" type="checkbox" /> IP</label>
+              <label class="check-label"><input name="use_attachment" type="checkbox" /> 附件</label>
+            </div>
+          </fieldset>
+          <div id="target-url-field" hidden>
+            <label>
+              URL
+              <input name="target_url" type="text" placeholder="https://target.example" />
+            </label>
+          </div>
+          <div id="target-ip-field" hidden>
+            <label>
+              IP
+              <input name="target_ip" type="text" placeholder="10.0.0.8 或 10.0.0.8:9999" />
+            </label>
+          </div>
+          <div id="target-file-field" hidden>
+            <label>
+              上传附件
+              <input name="attachment" type="file" />
+            </label>
+            <p class="field-note">可以和 URL 或 IP 一起使用。启动后在容器内直接读取。</p>
+            <p id="attachment-note" class="field-note" hidden></p>
+          </div>
+          <label class="check-label hint-toggle">
+            <input name="use_hint" type="checkbox" />
+            填写 Hint
+          </label>
+          <div id="hint-field" hidden>
+            <label>
+              Hint
+              <textarea name="hint" rows="3" placeholder="题目提示、范围或账号信息"></textarea>
+            </label>
+          </div>
+          <label>
+            目的
+            <textarea name="objective" rows="4" required>获取 flag，并说明利用路径。</textarea>
+          </label>
+        </div>
+        <p id="create-error" class="form-error" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancel-create" class="ghost-button" type="button">取消</button>
+          <button id="submit-create" type="submit">创建</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="settings-dialog">
+      <form id="settings-form" class="settings-form">
+        <div class="dialog-header">
+          <h2>运行配置</h2>
+          <button id="close-settings" class="ghost-button" type="button">关闭</button>
+        </div>
+        <div class="dialog-body">
+          <p class="settings-note">同时运行几个项目，和每个项目里同时跑几个 Codex，是两个独立限制。一个项目同时执行的 intent 数与它的 Codex 数相同。保存后只影响之后启动的项目；环境变量仍然优先。</p>
+          <label>
+            同时运行的项目数
+            <input name="max_concurrent_projects" type="number" min="1" step="1" required />
+          </label>
+          <label>
+            每个项目同时运行的 Codex 数
+            <input name="codex_max_slots" type="number" min="1" step="1" required />
+          </label>
+          <label>
+            Codex Base URL
+            <input name="base_url" type="url" required />
+          </label>
+          <label>
+            Codex Model
+            <input name="model" type="text" required />
+          </label>
+          <label>
+            Codex API Key
+            <input name="api_key" type="password" autocomplete="off" placeholder="留空表示不修改" />
+          </label>
+          <p id="api-key-hint" class="settings-note"></p>
+          <label class="check-label hint-toggle">
+            <input name="clear_api_key" type="checkbox" />
+            清除已保存的 API Key
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js?v=31"></script>
   </body>
 </html>

@@ -15,14 +15,15 @@ class FirstRunPromptTests(unittest.TestCase):
         intent = project.add_intent("初始探测", from_fact_id=0, to_fact_id=1)
         return project, intent
 
-    def test_first_run_prompt_allows_incremental_json(self) -> None:
+    def test_first_run_prompt_uses_one_json_for_flag(self) -> None:
         project, intent = self._project_with_intent()
 
         prompt = PromptBuilder().build_first_run_prompt(project, intent)  # type: ignore[arg-type]
 
-        # 允许中途多次输出 JSON：超时被中断时，已确认的事实仍能被 salvage 成 fact。
-        self.assertIn("同一次执行可以输出多个 JSON", prompt)
-        self.assertIn("结束时再输出最后一个总结", prompt)
+        self.assertIn("本次执行只输出一条 JSON", prompt)
+        self.assertIn("可以输出多条", prompt)
+        self.assertNotIn("同一次执行可以输出多个 JSON", prompt)
+        self.assertNotIn("结束时再输出最后一个总结", prompt)
         self.assertIn('"fact_description"', prompt)
 
     def test_explore_prompt_still_single_result(self) -> None:
@@ -32,6 +33,24 @@ class FirstRunPromptTests(unittest.TestCase):
 
         self.assertIn("只执行给定 intent", prompt)
         self.assertIn('"fact_description"', prompt)
+
+
+    def test_prompts_accept_ip_or_local_target(self) -> None:
+        project, intent = self._project_with_intent()
+        project.target_url = "10.0.0.8"
+        project.hint = "备用账号 admin"
+        project.objective = "拿到 flag"
+
+        first_run = PromptBuilder().build_first_run_prompt(project, intent)  # type: ignore[arg-type]
+        reason = PromptBuilder().build_reason_prompt(project)
+
+        self.assertIn("10.0.0.8", first_run)
+        self.assertIn("备用账号 admin", first_run)
+        self.assertIn("拿到 flag", first_run)
+        self.assertIn("不要假定它一定是网页地址", first_run)
+        self.assertIn("不要假定它一定是网页地址", reason)
+        self.assertIn("备用账号 admin", reason)
+        self.assertIn("拿到 flag", reason)
 
 
 class ReasonContextBudgetTests(unittest.TestCase):

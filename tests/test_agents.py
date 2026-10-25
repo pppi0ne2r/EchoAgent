@@ -234,6 +234,26 @@ time.sleep(5)
             )
 
 
+
+    def test_prepare_runtime_writes_pyghidra_mcp_config(self) -> None:
+        agent = CodexDockerAgent(workspace="/home/kali/workspace")
+        project = type("ProjectStub", (), {"docker": "worker-container"})()
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with patch("echo_agent.dispatcher.agents.subprocess.run", fake_run):
+            agent._prepare_runtime(project, "intents/4", log=None)  # type: ignore[arg-type]
+
+        self.assertEqual(len(calls), 1)
+        script = calls[0][-1]
+        self.assertIn("mcp_servers.pyghidra-mcp", script)
+        self.assertIn("http://127.0.0.1:8000/mcp", script)
+        self.assertIn("/home/kali/.codex/intents/4/config.toml", script)
+        self.assertIn("flock -w 10", script)
+
     def test_intent_command_uses_isolated_codex_home_and_workspace(self) -> None:
         agent = CodexDockerAgent(workspace="/home/kali/workspace")
         project = type("ProjectStub", (), {"docker": "worker-container"})()

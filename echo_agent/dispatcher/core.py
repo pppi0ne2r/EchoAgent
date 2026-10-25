@@ -288,6 +288,7 @@ class Dispatcher:
         self._log(project.id, "first-run initial intent started", "info", {"intent_id": intent.id})
         result = self._run_intent_with_slot(project, intent, DispatchMode.FIRST_RUN, scope="first-run")
         item = IntentExecutionResult(intent=intent, result=result)
+        before_facts = set(project.facts)
         try:
             self._commit_intent_result(project, item, release_project=release_project)
         except Exception as exc:
@@ -302,7 +303,11 @@ class Dispatcher:
             project.id,
             "first-run finished",
             "info" if not result.retryable else "warning",
-            {"intent_id": intent.id, "retryable": result.retryable},
+            {
+                "intent_id": intent.id,
+                "retryable": result.retryable,
+                "fact_ids": self._new_fact_ids(project, before_facts),
+            },
         )
         self._observe_target(item.result)
         fatal = self._fatal_upstream_result(project)
@@ -331,6 +336,7 @@ class Dispatcher:
         released_count = 0
         finished_items: list[IntentExecutionResult] = []
         for item in self._execute_intents(project, intents):
+            before_facts = set(project.facts)
             try:
                 self._commit_intent_result(project, item)
             except Exception as exc:
@@ -360,6 +366,7 @@ class Dispatcher:
                     "has_fact": bool(item.result.fact_description),
                     "has_answer": bool(item.result.answer),
                     "retryable": item.result.retryable,
+                    "fact_ids": self._new_fact_ids(project, before_facts),
                 },
             )
             finished_items.append(item)
@@ -469,7 +476,12 @@ class Dispatcher:
                 self._complete_project(project)
                 self._no_progress_reasons = 0
                 self._persist_step(project, release_project=release_project)
-                self._log(project.id, "reason marked project completed", "success", {"has_answer": True})
+                self._log(
+                    project.id,
+                    "reason marked project completed",
+                    "success",
+                    {"has_answer": True, "answer": result.answer},
+                )
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
             self._log(
                 project.id,
@@ -531,6 +543,7 @@ class Dispatcher:
                     }
                 ]
         planned_count = 0
+        planned_intent_ids: list[int] = []
         skipped_repeat = 0
         skipped_from = 0
         skipped_crypto = 0
@@ -571,80 +584,17 @@ class Dispatcher:
                 skipped_from += 1
                 continue
             action_key = str(item.get("action_key") or "")
-            crypto_metadata: dict[str, Any] = {}
-            if project.task_type == "crypto":
-                try:
-                    crypto_metadata = self._crypto_plan_metadata(project, item, from_fact_id)
-                    crypto_source = item.get("crypto") if isinstance(item.get("crypto"), dict) else {}
-                    misplaced = [key for key in Dispatcher._MISPLACED_CRYPTO_FIELDS
-                                 if key in item and key not in crypto_source]
-                    if misplaced:
-                        self._log(
-                            project.id,
-                            "crypto plan fields were placed outside crypto; moved into crypto: "
-                            + ", ".join(misplaced),
-                            "warning",
-                            {"moved_fields": misplaced,
-                             "action_key": str(item.get("action_key") or "")[:128]},
-                        )
-                except ValueError as exc:
-                    reject_crypto_plan(item, exc)
-                    continue
-            if project.task_type == "crypto":
-                try:
-                    candidate_metadata = plan_crypto_intents(project, crypto_metadata)
-                except ValueError as exc:
-                    reject_crypto_plan(item, exc)
-                    continue
-                if not candidate_metadata:
-                    skipped_repeat += 1
-                    continue
-            else:
-                if self._is_duplicate_intent(project, description, from_fact_id, action_key):
-                    skipped_repeat += 1
-                    continue
-                candidate_metadata = [crypto_metadata]
-            for candidate in candidate_metadata:
-                try:
-                    project.add_intent(
-                        description=description,
-                        from_fact_id=from_fact_id,
-                        to_fact_id=to_fact_id,
-                        action_key=action_key,
-                        crypto=candidate,
-                    )
-                except ValueError as exc:
-                    if project.task_type != "crypto":
-                        raise
-                    reject_crypto_plan(item, exc)
-                    continue
-                planned_count += 1
-        if crypto_rejections:
-            project.crypto["planning_feedback"] = {
-                "kind": "plan_contract_error",
-                "rejected_plans": crypto_rejections,
-                "rejected_count": skipped_crypto,
-                "instruction": "Correct these field errors; diagnostics are not evidence or refutation.",
-            }
-        if project.task_type == "crypto" and planned_count == 0 and skipped_crypto:
-            self._crypto_plan_failures += 1
-            self._persist_step(project, release_project=release_project)
-            exhausted = self._crypto_plan_failures >= self.max_retryable_attempts
-            self._log(
-                project.id,
-                "crypto planning contract errors persisted; dispatcher will stop" if exhausted
-                else "crypto planning contract errors; correction required",
-                "error" if exhausted else "warning",
-                {"attempt": self._crypto_plan_failures, "limit": self.max_retryable_attempts,
-                 "skipped_crypto_contract": skipped_crypto},
+            if self._is_duplicate_intent(project, description, from_fact_id, action_key):
+                skipped_repeat += 1
+                continue
+            intent = project.add_intent(
+                description=description,
+                from_fact_id=from_fact_id,
+                to_fact_id=to_fact_id,
+                action_key=action_key,
             )
-            return DispatchResult(
-                project.id, DispatchMode.SKIPPED if exhausted else DispatchMode.REASON, project.status,
-                "crypto planning contract errors persisted" if exhausted
-                else "crypto plan contract rejected; will retry",
-            )
-        if project.task_type == "crypto":
-            self._crypto_plan_failures = 0
+            planned_intent_ids.append(intent.id)
+            planned_count += 1
         if planned_count == 0 and result.salvaged:
             self._reason_salvage_failures += 1
             self._persist_step(project, release_project=release_project)
@@ -678,8 +628,11 @@ class Dispatcher:
             project.id,
             f"reason planned {planned_count} new intents",
             "info",
-            {"skipped_repeat": skipped_repeat, "skipped_unplannable_from": skipped_from,
-             "skipped_crypto_contract": skipped_crypto},
+            {
+                "intent_ids": planned_intent_ids,
+                "skipped_repeat": skipped_repeat,
+                "skipped_unplannable_from": skipped_from,
+            },
         )
         if planned_count == 0 and self._no_progress_reasons >= self.max_retryable_attempts:
             message = "reason made no progress"
@@ -843,7 +796,7 @@ class Dispatcher:
         producers = [
             intent
             for intent in project.intents.values()
-            if intent.to_fact_id == fact_id and intent.from_fact_id is not None
+            if fact_id in intent.to_fact_ids and intent.from_fact_id is not None
         ]
         if producers:
             latest = max(producers, key=lambda item: item.id)
@@ -1148,6 +1101,17 @@ class Dispatcher:
 
     @staticmethod
     def _apply_intent_result(project: Project, item: IntentExecutionResult) -> None:
+        intent = item.intent
+        before_facts = set(project.facts)
+        try:
+            Dispatcher._apply_intent_result_body(project, item)
+        finally:
+            produced = [fact_id for fact_id in project.facts if fact_id not in before_facts]
+            if produced:
+                intent.set_targets(produced)
+
+    @staticmethod
+    def _apply_intent_result_body(project: Project, item: IntentExecutionResult) -> None:
         result = item.result
         intent = item.intent
         Dispatcher._backfill_answer_source(project, result)
@@ -1159,18 +1123,22 @@ class Dispatcher:
             Dispatcher._apply_crypto_intent_result(project, item)
             return
         if result.timed_out:
-            Dispatcher._store_worker_observations(project, result, intent)
+            Dispatcher._store_worker_observations(project, result, intent.from_fact_id)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(
                     IntentOutcome.ERROR,
                     note="execution timed out after partial facts were saved; intent left incomplete",
                 )
             return
-        for prior in result.prior_results:
-            Dispatcher._add_prior_fact(project, prior, intent)
+        existing_fact_ids = set(project.facts)
+        priors = result.prior_results
+        if result.outcome != "error":
+            priors = Dispatcher._without_duplicate_answers(priors, result)
+        for prior in priors:
+            Dispatcher._add_prior_fact(project, prior, intent.from_fact_id)
         if result.outcome == "error":
-            Dispatcher._persist_json_facts_from_detail(project, result.detail, intent)
-            Dispatcher._record_partial_output(project, result.detail, intent)
+            Dispatcher._persist_json_facts_from_detail(project, result.detail, intent.from_fact_id)
+            Dispatcher._record_partial_output(project, result.detail)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
             return
@@ -1185,6 +1153,11 @@ class Dispatcher:
                 crypto=Dispatcher._crypto_fact_metadata(project, intent),
             )
             intent.mark_completed(to_fact_id=fact.id, outcome=IntentOutcome.REFUTED)
+            return
+        new_facts = [project.facts[fact_id] for fact_id in project.facts if fact_id not in existing_fact_ids]
+        if Dispatcher._final_answer_already_recorded(result, new_facts):
+            if intent.status == IntentStatus.RUNNING and new_facts:
+                intent.mark_completed(to_fact_id=new_facts[-1].id, outcome=IntentOutcome.VERIFIED)
             return
         fact_text = Dispatcher._worker_result_fact_text(result)
         if fact_text:
@@ -1373,8 +1346,60 @@ class Dispatcher:
             intent.mark_failed(IntentOutcome.EMPTY, note="crypto intent returned no confirmed observation")
 
 
+
     @staticmethod
-    def _store_worker_observations(project: Project, result: WorkerResult, intent: Intent | None = None) -> int:
+    def _answer_covered_by_facts(answer: str | None, fact_texts: list[str]) -> bool:
+        if not answer:
+            return False
+        needle = answer.strip()
+        if not needle:
+            return False
+        return any(needle in text for text in fact_texts)
+
+    @staticmethod
+    def _without_duplicate_answers(
+        priors: list[WorkerObservation],
+        result: WorkerResult,
+    ) -> list[WorkerObservation]:
+        fact_texts: list[str] = []
+        for prior in priors:
+            text = _optional_fact_description(prior.fact_description)
+            if text:
+                fact_texts.append(text)
+        final_text = _optional_fact_description(result.fact_description)
+        if final_text:
+            fact_texts.append(final_text)
+        kept: list[WorkerObservation] = []
+        for prior in priors:
+            if (
+                not _optional_fact_description(prior.fact_description)
+                and prior.answer
+                and prior.outcome != "refuted"
+                and Dispatcher._answer_covered_by_facts(prior.answer, fact_texts)
+            ):
+                continue
+            kept.append(prior)
+        return kept
+
+    @staticmethod
+    def _final_answer_already_recorded(result: WorkerResult, new_facts: list[object]) -> bool:
+        if _optional_fact_description(result.fact_description) or not result.answer:
+            return False
+        if result.outcome == "refuted":
+            return False
+        texts = [
+            str(getattr(fact, "description", ""))
+            for fact in new_facts
+            if getattr(fact, "kind", None) == FactKind.EVIDENCE
+        ]
+        return Dispatcher._answer_covered_by_facts(result.answer, texts)
+
+    @staticmethod
+    def _store_worker_observations(
+        project: Project,
+        result: WorkerResult,
+        from_fact_id: int | None = None,
+    ) -> int:
         observations = list(result.prior_results)
         if result.fact_description or result.answer:
             observations.append(
@@ -1388,12 +1413,15 @@ class Dispatcher:
             )
         before = len(project.facts)
         for observation in observations:
-            Dispatcher._add_prior_fact(project, observation, intent)
+            Dispatcher._add_prior_fact(project, observation, from_fact_id)
         return len(project.facts) - before
 
     @classmethod
     def _persist_json_facts_from_detail(
-        cls, project: Project, detail: str | None, intent: Intent | None = None
+        cls,
+        project: Project,
+        detail: str | None,
+        from_fact_id: int | None = None,
     ) -> int:
         if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
             return 0
@@ -1402,7 +1430,7 @@ class Dispatcher:
             parsed = parse_worker_result(tail)
         except ValueError:
             return 0
-        return cls._store_worker_observations(project, parsed, intent)
+        return cls._store_worker_observations(project, parsed, from_fact_id)
 
     @staticmethod
     def _reason_result_from_repair(exc: ReasonFormatError) -> ReasonResult | None:
@@ -1416,16 +1444,10 @@ class Dispatcher:
 
     @staticmethod
     def _add_prior_fact(
-        project: Project, observation: WorkerObservation, intent: Intent | None = None
-    ) -> None:
-        supplied_fact = observation.crypto.get("fact", {}) if project.task_type == "crypto" else {}
-        if project.task_type == "crypto" and Dispatcher._is_crypto_candidate(observation.answer, observation.crypto):
-            Dispatcher._save_crypto_candidate(project, intent, observation.answer, observation.fact_description, observation.crypto)
-            return
-        if project.task_type == "crypto" and (not isinstance(supplied_fact, dict) or supplied_fact.get("claim_status") != "observed"):
-            Dispatcher._record_crypto_pending(project, intent, observation.fact_description,
-                                              "prior observation lacks crypto.fact.claim_status=observed; not evidence")
-            return
+        project: Project,
+        observation: WorkerObservation,
+        from_fact_id: int | None = None,
+    ) -> object | None:
         fact_text = _optional_fact_description(observation.fact_description)
         if not fact_text and observation.answer:
             fact_text = f"agent reported possible final answer: {observation.answer}"
@@ -1434,130 +1456,12 @@ class Dispatcher:
         if observation.answer_source:
             fact_text = f"{fact_text}\nsource: {observation.answer_source}"
         if observation.outcome == "refuted":
-            crypto = Dispatcher._crypto_fact_metadata(project, intent, observation.crypto)
-            if project.task_type == "crypto":
-                covered_scope = observation.crypto.get("covered_scope", {})
-                if not isinstance(covered_scope, dict) or not covered_scope:
-                    return
-                fact_text = f"{fact_text}\ncovered_scope: {json.dumps(covered_scope, ensure_ascii=False, sort_keys=True)}"
-            kind = FactKind.EVIDENCE if project.task_type == "crypto" and crypto.get("observation_kind") == "evidence" else FactKind.REFUTED
-            project.add_fact(
-                fact_text, kind=kind,
-                crypto=crypto,
-            )
+            fact = project.add_fact(fact_text, kind=FactKind.REFUTED)
+        elif observation.outcome == "error":
             return
-        if observation.outcome == "error":
-            return
-        project.add_fact(
-            fact_text, kind=FactKind.EVIDENCE,
-            crypto=Dispatcher._crypto_fact_metadata(project, intent, observation.crypto),
-        )
-
-    @staticmethod
-    def _crypto_fact_metadata(project: Project, intent: Intent | None, output_crypto: dict[str, Any] | None = None) -> dict[str, object]:
-        if project.task_type != "crypto" or intent is None:
-            return {}
-        dependencies = intent.crypto.get("input_fact_ids")
-        if dependencies is None:
-            dependencies = [intent.from_fact_id] if intent.from_fact_id is not None else []
-        metadata: dict[str, object] = {
-            "producer_intent_id": intent.id,
-            "depends_on_fact_ids": dependencies,
-        }
-        if intent.crypto.get("input_ids"):
-            metadata["source_input_ids"] = intent.crypto["input_ids"]
-        supplied = (output_crypto or {}).get("fact", {})
-        if isinstance(supplied, dict):
-            for key in ("source_input_ids", "typed_value", "artifact_refs", "observation_kind", "claim_status"):
-                if key in supplied:
-                    metadata[key] = supplied[key]
-        return metadata
-
-    @staticmethod
-    def _is_crypto_candidate(answer: str | None, output_crypto: dict[str, Any]) -> bool:
-        fact = output_crypto.get("fact", {})
-        return bool(answer) or "candidate" in output_crypto or (isinstance(fact, dict) and fact.get("claim_status") == "candidate")
-
-    @staticmethod
-    def _record_crypto_pending(project: Project, intent: Intent | None, text: str | None, reason: str) -> None:
-        if not text:
-            return
-        metadata = Dispatcher._crypto_fact_metadata(project, intent)
-        metadata.update({"claim_status": "hypothesis", "diagnostic": reason[:600]})
-        project.add_fact(f"待核实观察：{text}\n诊断：{reason}", kind=FactKind.ERROR, crypto=metadata)
-
-    @staticmethod
-    def _save_crypto_candidate(project: Project, intent: Intent | None, answer: str | None,
-                               description: str | None, output_crypto: dict[str, Any]) -> int:
-        if project.task_type != "crypto" or intent is None:
-            raise ValueError("candidate save requires a crypto project and producer intent")
-        candidate = output_crypto.get("candidate")
-        if not isinstance(candidate, dict):
-            candidate = {"answer": answer} if answer else {}
-        if not isinstance(candidate.get("answer"), str) or not candidate["answer"]:
-            raise ValueError("candidate.answer must be a nonempty string")
-        if answer is not None and candidate["answer"] != answer:
-            raise ValueError("answer and crypto.candidate.answer disagree")
-        metadata = Dispatcher._crypto_fact_metadata(project, intent, output_crypto)
-        # Candidate identity is expressed by claim_status; observation_kind has no
-        # candidate value in the contract.  Normalize instead of losing the answer.
-        metadata["observation_kind"] = "evidence"
-        metadata["claim_status"] = "candidate"
-        metadata["candidate"] = candidate
-        fact = project.add_fact(description or f"candidate answer: {candidate['answer']}",
-                                kind=FactKind.CANDIDATE, crypto=metadata)
-        return fact.id
-
-    @staticmethod
-    def _ensure_crypto_candidate(project: Project, answer: str) -> object | None:
-        text = answer.strip()
-        if not text:
-            return None
-        for fact in sorted(project.facts.values(), key=lambda item: item.id, reverse=True):
-            if fact.kind == FactKind.CANDIDATE and fact.crypto.get("candidate", {}).get("answer") == text:
-                return fact
-        input_ids = [ref["id"] for ref in project.crypto.get("inputs", [])]
-        return project.add_fact(f"candidate answer: {text}", kind=FactKind.CANDIDATE,
-                                crypto={"claim_status": "candidate", "source_input_ids": input_ids,
-                                        "candidate": {"answer": text, "scheme": "auto"}})
-
-    def _crypto_answer_verified(self, project: Project, answer: str) -> bool:
-        return self._crypto_completion_source(project, answer) is not None
-
-    def _crypto_completion_source(self, project: Project, answer: str) -> str | None:
-        verifier = getattr(self.client, "verify_crypto_candidate", None)
-        if not callable(verifier):
-            return None
-        return completion_source(project, answer, lambda fact_id: verifier(project.id, fact_id))
-
-    @staticmethod
-    def _connect_crypto_answer_to_goal(project: Project, answer: str) -> None:
-        if 1 not in project.facts:
-            return
-        source = None
-        description = "候选答案通过原始输入独立校验"
-        for record in reversed(project.crypto.get("verifications", [])):
-            if record.get("status") == "pass" and record.get("answer") == answer:
-                source = record["candidate_fact_id"]
-                break
-        if source is None:
-            for record in reversed(project.crypto.get("acceptances", [])):
-                if record.get("answer") == answer and record.get("candidate_fact_id") in project.facts:
-                    source = record["candidate_fact_id"]
-                    description = "候选答案获得平台回执"
-                    break
-        if source is None:
-            for fact in sorted(project.facts.values(), key=lambda item: item.id, reverse=True):
-                if fact_supports_answer(fact, answer):
-                    source = fact.id
-                    description = "证据事实包含最终答案"
-                    break
-        if source is None:
-            return
-        if not any(i.from_fact_id == source and i.to_fact_id == 1 for i in project.intents.values()):
-            intent = project.add_intent(description, from_fact_id=source, to_fact_id=1)
-            intent.mark_running()
-            intent.mark_completed()
+        else:
+            fact = project.add_fact(fact_text, kind=FactKind.EVIDENCE)
+        return fact
 
     def _execute_intent(self, project: Project, intent: Intent, mode: DispatchMode) -> WorkerResult:
         if project.task_type == "crypto" and intent.crypto.get("method") == "verify.candidate":
@@ -1803,6 +1707,12 @@ class Dispatcher:
             return same_text
         return same_text or action_keys_equivalent(action_key, intent.action_key)
 
+    _INITIAL_PROBE_DESCRIPTION = "初始探测目标并提取可继续分析的关键事实"
+
+    @staticmethod
+    def _is_initial_probe_intent(intent: Intent) -> bool:
+        return intent.description == Dispatcher._INITIAL_PROBE_DESCRIPTION
+
     @staticmethod
     def _create_initial_intent(project: Project) -> Intent:
         if project.task_type == "crypto":
@@ -1818,11 +1728,11 @@ class Dispatcher:
             )
         if 0 in project.facts and 1 in project.facts:
             return project.add_intent(
-                description="初始探测目标并提取可继续分析的关键事实",
+                description=Dispatcher._INITIAL_PROBE_DESCRIPTION,
                 from_fact_id=0,
                 to_fact_id=1,
             )
-        return project.add_intent(description="初始探测目标并提取可继续分析的关键事实")
+        return project.add_intent(description=Dispatcher._INITIAL_PROBE_DESCRIPTION)
 
     @staticmethod
     def _complete_intent_with_fact(project: Project, intent: Intent, fact_id: int) -> None:
@@ -1864,14 +1774,21 @@ class Dispatcher:
         )
         if source_fact is None:
             return
-        already_connected = any(
-            intent.from_fact_id == source_fact.id and intent.to_fact_id == 1
+        producers = [
+            intent
             for intent in project.intents.values()
-        )
-        if already_connected:
+            if source_fact.id in intent.to_fact_ids and not Dispatcher._is_initial_probe_intent(intent)
+        ]
+        if producers:
+            max(producers, key=lambda item: item.id).add_target(1)
+            return
+        if any(
+            intent.from_fact_id == source_fact.id and 1 in intent.to_fact_ids
+            for intent in project.intents.values()
+        ):
             return
         intent = project.add_intent(
-            description="确认该事实包含最终答案",
+            description="得到最终结果",
             from_fact_id=source_fact.id,
             to_fact_id=1,
         )
@@ -1958,6 +1875,10 @@ class Dispatcher:
             self._release_project(project)
             self.client.save_project(project)
             self._log(project.id, "project released to stoped", "info")
+
+    @staticmethod
+    def _new_fact_ids(project: Project, before: set[int]) -> list[int]:
+        return [fact_id for fact_id in project.facts if fact_id not in before]
 
     def _log(
         self,

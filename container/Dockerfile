@@ -25,6 +25,7 @@ RUN apt update && \
       python3 \
       python3-pip \
       ripgrep \
+      openjdk-21-jdk-headless \
       sudo \
       unzip \
       wget \
@@ -32,6 +33,18 @@ RUN apt update && \
       yq && \
     apt clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+RUN java_home="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")" && \
+    ln -sfn "$java_home" /usr/lib/jvm/java-21-openjdk && \
+    wget ${WGET_RETRY_FLAGS} -O /tmp/ghidra.zip \
+      https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip && \
+    unzip -q /tmp/ghidra.zip -d /opt && \
+    mv /opt/ghidra_12.1.4_PUBLIC /opt/ghidra && \
+    rm /tmp/ghidra.zip && \
+    pip3 install --break-system-packages --no-cache-dir pyghidra-mcp==0.2.7
 
 RUN useradd -m -s /bin/bash kali && \
     echo "kali ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
@@ -74,3 +87,15 @@ COPY ./.agents /home/kali/workspace/.agents
 COPY ./AGENTS.md /home/kali/workspace/AGENTS.md
 
 WORKDIR /home/kali/workspace
+
+COPY ./entrypoint.sh /opt/echo-agent/entrypoint.sh
+COPY ./codex-config.toml /opt/echo-agent/codex-config.toml
+USER root
+RUN chmod 755 /opt/echo-agent/entrypoint.sh && \
+    mkdir -p /home/kali/.codex /home/kali/ghidra-projects && \
+    cp /opt/echo-agent/codex-config.toml /home/kali/.codex/config.toml && \
+    chown -R kali:kali /home/kali/.codex /home/kali/ghidra-projects /opt/echo-agent
+USER kali
+
+ENTRYPOINT ["/opt/echo-agent/entrypoint.sh"]
+CMD ["sleep", "infinity"]

@@ -81,6 +81,25 @@ class CryptoExecutionLimit(RuntimeError):
         self.reason = reason
 
 
+
+PYGHIDRA_MCP_CONFIG = """[mcp_servers.pyghidra-mcp]
+url = "http://127.0.0.1:8000/mcp"
+startup_timeout_sec = 180
+tool_timeout_sec = 300
+"""
+
+
+def _ensure_codex_mcp_config(codex_home: str) -> str:
+    config_path = f"{codex_home}/config.toml"
+    marker = "mcp_servers.pyghidra-mcp"
+    write_config = (
+        f"if [ ! -f {shlex.quote(config_path)} ] || ! grep -q {shlex.quote(marker)} {shlex.quote(config_path)}; then "
+        f"printf %s {shlex.quote(PYGHIDRA_MCP_CONFIG)} >> {shlex.quote(config_path)}; "
+        "fi"
+    )
+    return f"flock -w 10 {shlex.quote(f'{codex_home}/config.toml.lock')} sh -c {shlex.quote(write_config)};"
+
+
 class CodexDockerAgent:
     def __init__(
         self,
@@ -317,7 +336,8 @@ class CodexDockerAgent:
                 "]; then ln -sfn",
                 shlex.quote(f"{shared}/.agents"),
                 shlex.quote(f"{workspace}/.agents"),
-                "; fi",
+                "; fi;",
+                _ensure_codex_mcp_config(codex_home),
             ]
         )
         command = ["docker", "exec", "-i", project.docker, "sh", "-lc", script]
