@@ -169,6 +169,19 @@ def extension_resource(item: ExtensionItem) -> ProjectResource:
 BUILTIN_VERSION = 2
 
 
+def _resource_size(path: Path) -> int | None:
+    if path.is_file():
+        return path.stat().st_size
+    if not path.is_dir():
+        return None
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_symlink() or not child.is_file():
+            continue
+        total += child.stat().st_size
+    return total
+
+
 class ExtensionCatalog:
     def __init__(self, path: Path, resource_root: Path) -> None:
         self.path = path
@@ -186,7 +199,7 @@ class ExtensionCatalog:
             resource = extension_resource(item)
             host_path = self.host_path(resource)
             downloaded = bool(exists(host_path))
-            size = host_path.stat().st_size if downloaded and host_path.is_file() else None
+            size = _resource_size(host_path) if downloaded else None
             items.append(
                 {
                     **item.to_dict(),

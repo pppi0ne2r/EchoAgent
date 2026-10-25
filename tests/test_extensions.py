@@ -137,7 +137,10 @@ class ExtensionCatalogTests(unittest.TestCase):
             )
             ready = runtime.extensions.public_items(runtime._resource_exists)
             self.assertEqual(ready[0]["status"], "ready")
+            self.assertEqual(ready[0]["size"], 3)
             self.assertEqual(ready[1]["status"], "failed")
+            self.assertIsNone(ready[1]["size"])
+            self.assertEqual(ready[2]["size"], 3)
 
 
 class ExtensionBuiltinUpgradeTests(unittest.TestCase):
@@ -681,6 +684,30 @@ class SkillRepositoryImportTests(unittest.TestCase):
             self.assertTrue((installed / "ctf-web" / "SKILL.md").is_file())
             self.assertEqual((installed / "notes.md").read_text(), "keep")
             self.assertFalse(any(item.name == "ctf-web" for item in catalog.list_items()))
+
+    def test_directory_skill_reports_recursive_file_size(self) -> None:
+        script = "print(1)\n"
+        content = self._zip(
+            {
+                "repo-main/ctf-web/SKILL.md": self._skill("ctf-web"),
+                "repo-main/ctf-web/scripts/run.py": script,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content):
+                items = catalog.import_skill_repository("https://github.com/acme/ctf-skills")
+            runtime = self._runtime(root, catalog)
+            self.assertEqual(runtime.update_extensions(item_id=items[0].id), [])
+            published = catalog.public_items(runtime._resource_exists)
+            skill = next(item for item in published if item["name"] == "ctf-web")
+            skill_dir = root / "resources" / "skills" / "ctf-web"
+            expected = sum(path.stat().st_size for path in skill_dir.rglob("*") if path.is_file())
+            self.assertTrue(skill_dir.is_dir())
+            self.assertGreater(expected, len(script))
+            self.assertEqual(skill["size"], expected)
+            self.assertTrue(all(item["size"] is None for item in published if not item["downloaded"]))
 
     def test_invalid_skill_is_skipped_when_another_is_valid(self) -> None:
         content = self._zip(

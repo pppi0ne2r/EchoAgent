@@ -2604,6 +2604,7 @@ async function importExtensionFile(kind, file) {
 }
 
 function formatBytes(size) {
+  if (size === null || size === undefined || size === "") return "";
   const value = Number(size);
   if (!Number.isFinite(value) || value < 0) return "";
   if (value < 1024) return `${value} B`;
