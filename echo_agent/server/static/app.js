@@ -35,6 +35,7 @@ const els = {
   editProject: document.querySelector("#edit-project"),
   runProject: document.querySelector("#run-project"),
   stopProject: document.querySelector("#stop-project"),
+  resetProject: document.querySelector("#reset-project"),
   exportWriteup: document.querySelector("#export-writeup"),
   deleteProject: document.querySelector("#delete-project"),
   title: document.querySelector("#project-title"),
@@ -336,6 +337,7 @@ function updateActionButtons() {
   els.editProject.disabled = !hasProject || state.busy || canStop;
   els.runProject.disabled = !hasProject || state.busy || !canRun;
   els.stopProject.disabled = !hasProject || state.busy || !canStop;
+  if (els.resetProject) els.resetProject.disabled = !hasProject || state.busy || canStop;
   els.deleteProject.disabled = !hasProject || state.busy || canStop;
   if (els.uploadForm) {
     els.uploadForm.querySelector('button[type="submit"]').disabled = !hasProject || state.busy || project.task_type !== "crypto" || canStop || project.status === "completed";
@@ -2386,6 +2388,23 @@ els.stopProject.addEventListener("click", async () => {
       method: "DELETE",
     });
     await refreshCurrent();
+  });
+});
+
+els.resetProject?.addEventListener("click", async () => {
+  if (!state.currentProjectId) return;
+  const name = state.currentProject?.name || `#${state.currentProjectId}`;
+  const confirmed = window.confirm(
+    `清空项目「${name}」的做题进度？名称、目标、附件和配置会保留，fact / intent、日志和工作区结果会删除，之后可以重新开始。`,
+  );
+  if (!confirmed) return;
+  await withAction("resetting progress...", async () => {
+    await api(`/projects/${state.currentProjectId}/reset`, { method: "POST" });
+    state.selectedFactId = null;
+    state.selectedIntentId = null;
+    state.writeupStatus = null;
+    await refreshCurrent();
+    await loadLogs({ reset: true });
   });
 });
 

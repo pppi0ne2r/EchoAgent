@@ -192,7 +192,7 @@ class PromptBuilder:
                 "不是每条 evidence 都需要生成 intent；只选择对达成目标有价值、能继续验证或利用的 evidence 生成 intent。",
                 "每个新 intent 的 from 必须取 allowed_from 里的 fact id。evidence 为空时 allowed_from 只有起点，通常是 0。",
                 "不能使用 findings、do_not_repeat、already_done、证伪事实、错误事实或 goal 作为 from。",
-                "to 可以为 null，系统会先临时连接到目标终点 fact。",
+                "to 必须为 null。未执行完成前不要指向 goal，系统不会把空目标临时连到终点。",
                 f"每条 intent 必须带稳定的 action_key，使用小写英文和连字符，例如 {_EXAMPLE_ACTION_KEY}。",
                 "already_done 中 outcome 为 refuted 或 verified 的动作不能再规划，即使更换 action_key 或换一种说法也不行。",
                 "outcome 为 error 或 empty 时，不要重复原来的 description；只有描述明显更小的新步骤才可以规划。",

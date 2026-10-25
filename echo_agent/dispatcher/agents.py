@@ -529,6 +529,7 @@ class CodexDockerAgent:
         last_log_flush_at = started_at
         last_activity_count = 0
         activity_count = 0
+        hard_timeout_deferred = False
         no_output_timeout_seconds = self._no_output_timeout_for_mode(mode)
         timeout_seconds = self._timeout_for_mode(mode)
         while process.poll() is None:
@@ -554,7 +555,34 @@ class CodexDockerAgent:
             if current_activity_count != activity_count:
                 activity_count = current_activity_count
                 last_activity_at = time.monotonic()
-            if elapsed > timeout_seconds:
+            idle_seconds = time.monotonic() - last_activity_at
+            # 只要启用了无输出超时，并且进程已经产生过输出，墙钟超时就不再判失败。
+            # 进程变安静后由下面的 no-output 超时处理。
+            output_defers_hard_timeout = no_output_timeout_seconds > 0 and activity_count > 0
+            if (
+                elapsed > timeout_seconds
+                and output_defers_hard_timeout
+                and idle_seconds <= no_output_timeout_seconds
+                and not hard_timeout_deferred
+            ):
+                hard_timeout_deferred = True
+                with output_lock:
+                    output_count = len(output_lines)
+                self._log(
+                    log,
+                    (
+                        f"codex agent passed {timeout_seconds}s in {mode.value} mode "
+                        "but is still producing output; hard timeout deferred"
+                    ),
+                    "info",
+                    {
+                        "timeout_seconds": timeout_seconds,
+                        "elapsed_seconds": int(elapsed),
+                        "idle_seconds": int(idle_seconds),
+                        "output_lines": output_count,
+                    },
+                )
+            if elapsed > timeout_seconds and not output_defers_hard_timeout:
                 self._kill_process(process)
                 process.wait()
                 stdout_reader.join(timeout=1)

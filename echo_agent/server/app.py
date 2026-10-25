@@ -620,6 +620,30 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
 
+    @app.post("/projects/{project_id}/reset")
+    def reset_project_progress(project_id: int) -> dict[str, Any]:
+        with app.state.store.project_lock(project_id):
+            try:
+                run_state = app.state.dispatcher_runner.status(project_id)
+                if run_state.queued or run_state.running:
+                    raise HTTPException(
+                        status_code=HTTPStatus.CONFLICT,
+                        detail="项目正在运行或排队，请先停止后再清空进度",
+                    )
+                writeup = app.state.writeup_service.status(project_id)
+                if writeup.get("status") == "running":
+                    raise HTTPException(
+                        status_code=HTTPStatus.CONFLICT,
+                        detail="WP 正在生成，请稍后再清空进度",
+                    )
+                project = app.state.store.reset_project_progress(project_id)
+                app.state.workspace.clear_runtime(project)
+                app.state.crypto_service.files.clear_artifacts(project_id)
+                app.state.writeup_service.forget(project_id)
+                return project.to_dict()
+            except ProjectNotFoundError as exc:
+                raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+
     @app.get("/projects/{project_id}/run")
     def get_project_run_status(project_id: int) -> dict[str, Any]:
         try:

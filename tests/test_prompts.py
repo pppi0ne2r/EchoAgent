@@ -81,6 +81,8 @@ class ReasonContextBudgetTests(unittest.TestCase):
 
         self.assertIn("source:", prompt)
         self.assertIn("只能用来核验答案是否真实出现过", prompt)
+        self.assertIn("to 必须为 null", prompt)
+        self.assertNotIn("临时连接到目标终点", prompt)
 
 
 if __name__ == "__main__":

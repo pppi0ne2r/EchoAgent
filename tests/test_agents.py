@@ -147,7 +147,7 @@ print(json.dumps({"answer": None, "fact_description": "font cache rce", "outcome
 print(json.dumps({"answer": None, "fact_description": "upload missing", "outcome": "refuted"}, ensure_ascii=False), flush=True)
 time.sleep(5)
 """
-        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=30)
+        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=0)
         output = agent._run_process(
             ("python3", "-c", script),
             prompt="hello",
@@ -157,6 +157,45 @@ time.sleep(5)
         )
         self.assertIn("font cache rce", output)
         self.assertIn("upload missing", output)
+
+    def test_continuous_output_is_not_failed_by_hard_timeout(self) -> None:
+        script = """
+import sys, time
+sys.stdin.read()
+for index in range(8):
+    print(f"still working {index}", flush=True)
+    time.sleep(0.25)
+"""
+        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=30)
+        output = agent._run_process(
+            ("python3", "-c", script),
+            prompt="hello",
+            mode=DispatchMode.EXPLORE,
+            env=None,
+            log=None,
+        )
+        self.assertIn("still working 7", output)
+
+    def test_quiet_process_still_fails_on_no_output_after_hard_timeout(self) -> None:
+        script = """
+import sys, time
+sys.stdin.read()
+print("partial before hang", flush=True)
+time.sleep(5)
+"""
+        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=2)
+        with self.assertRaises(RuntimeError) as caught:
+            agent._run_process(
+                ("python3", "-c", script),
+                prompt="hello",
+                mode=DispatchMode.EXPLORE,
+                env=None,
+                log=None,
+            )
+        message = str(caught.exception)
+        self.assertIn("no-output timed out", message)
+        self.assertNotIn("after 1s", message)
+        self.assertIn("partial before hang", message)
 
     def test_no_output_timeout_keeps_progress_tail_without_promoting_it(self) -> None:
         script = """
@@ -328,7 +367,7 @@ print(json.dumps({"answer": None, "fact_description": "hidden ssrf endpoint", "o
 print(json.dumps({"answer": None, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}, ensure_ascii=False), flush=True)
 time.sleep(5)
 """
-        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=30)
+        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=0)
 
         output = agent._run_process(
             ("python3", "-c", script),

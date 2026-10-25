@@ -127,6 +127,14 @@ class WriteupService:
         self._jobs: dict[int, WriteupJob] = {}
         self._threads: dict[int, threading.Thread] = {}
 
+    def forget(self, project_id: int) -> None:
+        with self._lock:
+            thread = self._threads.get(project_id)
+            if thread is not None and thread.is_alive():
+                return
+            self._jobs.pop(project_id, None)
+            self._threads.pop(project_id, None)
+
     def status(self, project_id: int) -> dict[str, object]:
         project = self.store.get_project(project_id)
         with self._lock:

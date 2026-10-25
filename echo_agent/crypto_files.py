@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -52,6 +53,16 @@ class CryptoProjectFiles:
                 raise ValueError("crypto project directory escapes its root")
             directory.mkdir(parents=True, exist_ok=True)
         return inputs.resolve(), intents.resolve()
+
+    def clear_artifacts(self, project_id: int) -> None:
+        project = self.project_root(project_id)
+        artifacts = project / "artifacts"
+        if not artifacts.exists():
+            return
+        resolved = artifacts.resolve()
+        if not resolved.is_relative_to(project.resolve()):
+            raise ValueError("crypto project directory escapes its root")
+        shutil.rmtree(resolved)
 
     def resolve_ref(self, project_id: int, ref: dict[str, Any], kind: str) -> Path:
         if kind == "input":

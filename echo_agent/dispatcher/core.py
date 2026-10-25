@@ -578,8 +578,10 @@ class Dispatcher:
             to_fact_id = self._valid_fact_id(project, item.get("to"))
             if to_fact_id is not None and not self._is_goal_or_evidence(project, to_fact_id):
                 to_fact_id = None
-            if to_fact_id is None and 1 in project.facts:
-                to_fact_id = 1
+            # 规划阶段不能把尚未执行的 intent 连到 goal。空目标或指向终点都先留空，
+            # 执行得到事实后再连接；只有最终答案才连到 F1。
+            if to_fact_id is not None and project.facts[to_fact_id].kind == FactKind.GOAL:
+                to_fact_id = None
             if from_fact_id is None:
                 skipped_from += 1
                 continue

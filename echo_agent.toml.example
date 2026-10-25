@@ -43,7 +43,10 @@ reason_model = "gpt-5.5"
 # Working directory inside the project container.
 workspace = "/home/kali/workspace"
 
-# Hard process timeout for one Codex invocation.
+# Wall-clock limit for one Codex invocation.
+# While stdout/stderr is still arriving, this limit is deferred.
+# A run fails only after no_output_timeout_seconds of silence, unless that
+# idle guard is 0. Then this wall-clock limit always applies.
 timeout_seconds = 1800
 
 # Optional per-mode overrides. Unset modes fall back to timeout_seconds.

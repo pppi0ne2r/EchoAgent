@@ -228,7 +228,7 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         branch_intents = [intent for intent in saved.intents.values() if intent.from_fact_id == 2]
         self.assertEqual(len(branch_intents), 2)
         self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
-        self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+        self.assertTrue(all(intent.to_fact_id is None for intent in branch_intents))
         planned = next(log for log in client.logs if str(log["message"]).startswith("reason planned"))
         self.assertEqual(planned["metadata"]["intent_ids"], [intent.id for intent in branch_intents])
 
@@ -260,7 +260,7 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         branch_intents = [intent for intent in saved.intents.values() if intent.from_fact_id == 2]
         self.assertEqual(len(branch_intents), 2)
         self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
-        self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+        self.assertTrue(all(intent.to_fact_id is None for intent in branch_intents))
 
     def test_explore_saves_each_completed_intent_before_all_finish(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)

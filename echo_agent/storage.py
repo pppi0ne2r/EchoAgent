@@ -556,6 +556,29 @@ class SQLiteProjectStore:
             self.after_clear_logs(project_id)
         return {"project_id": project_id, "deleted": deleted}
 
+    def reset_project_progress(self, project_id: int) -> Project:
+        """Drop facts, intents, and logs while keeping the project setup.
+
+        Completed projects become active so they can run again. Running projects
+        are rejected; the caller must stop the dispatcher first.
+        """
+        with self.project_lock(project_id):
+            project = self.get_project(project_id)
+            if project.status == ProjectStatus.RUNNING:
+                raise ProjectConflictError("stop the project before resetting progress")
+            if project.status == ProjectStatus.COMPLETED:
+                project.status = ProjectStatus.ACTIVE
+            project.facts.clear()
+            project.intents.clear()
+            if project.task_type == "crypto":
+                for key in ("executions", "verifications", "acceptances", "planning_feedback"):
+                    project.crypto.pop(key, None)
+            _sync_boundary_facts(project)
+            self.save_project(project)
+            self.clear_project_logs(project_id)
+            self.add_project_log(project_id, "已清空进度，下次运行将重新开始")
+        return self.get_project(project_id)
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.database_path)

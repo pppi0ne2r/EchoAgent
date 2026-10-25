@@ -150,6 +150,22 @@ class ProjectWorkspace:
         if path.exists():
             path.write_text("", encoding="utf-8")
 
+    def clear_runtime(self, project: Project) -> None:
+        """Remove solver work products and the saved writeup. Keep attachments."""
+        directory = self.find(project.id)
+        if directory is None:
+            return
+        work = directory / "work"
+        if work.is_dir():
+            for child in work.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        writeup = directory / "records" / "wp.md"
+        if writeup.is_file():
+            writeup.unlink()
+
     def remove(self, project_id: int) -> None:
         directory = self.find(project_id)
         if directory is not None:
