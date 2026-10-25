@@ -5,21 +5,29 @@ import hashlib
 import re
 import tempfile
 import time
-from dataclasses import replace
+from dataclasses import is_dataclass, replace
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import uvicorn
 from starlette.requests import Request
 
 from echo_agent.config import DispatcherSettings
 from echo_agent.console_settings import public_dispatcher_settings, save_console_settings
-from echo_agent.models import Project, ProjectStatus
+from echo_agent.crypto_contract import artifact_ref, input_ref, project_crypto
+from echo_agent.crypto_files import CryptoProjectFiles, MAX_INPUT_BYTES, safe_input_filename
+from echo_agent.crypto_service import CryptoProjectService
+from echo_agent.crypto_verification import VerificationBusy
+from echo_agent.crypto_verify import candidate_digest, goal_sha256
+from echo_agent.models import FactKind, Project, ProjectStatus
 from echo_agent.server.attachments import MAX_ATTACHMENT_BYTES
 from echo_agent.server.project_workspace import ProjectWorkspace
 from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
 from echo_agent.server.schemas import (
+    AcceptanceRequest,
     ConsoleSettingsUpdate,
     FactCreateRequest,
     IntentCreateRequest,
@@ -63,11 +71,24 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     app.state.workspace.ensure_projects(store.list_projects())
     app.state.workspace.backfill_logs(store)
     store.refresh_boundary_facts()
-    app.state.project_runtime = replace(
-        DockerProjectRuntime.from_settings(),
-        attachment_root=app.state.attachment_root,
-        workspace=app.state.workspace,
-    )
+    runtime = DockerProjectRuntime.from_settings()
+    if is_dataclass(runtime) and not isinstance(runtime, type):
+        runtime = replace(
+            runtime,
+            attachment_root=app.state.attachment_root,
+            workspace=app.state.workspace,
+        )
+    else:
+        # Test doubles may not be dataclasses; attach the workspace when possible.
+        for attribute, value in (
+            ("attachment_root", app.state.attachment_root),
+            ("workspace", app.state.workspace),
+        ):
+            try:
+                setattr(runtime, attribute, value)
+            except (AttributeError, TypeError):
+                pass
+    app.state.project_runtime = runtime
     app.state.project_runtime.prepare_shared_resources()
     app.state.crypto_service = CryptoProjectService(
         CryptoProjectFiles(store.database_path.parent / "projects"),
@@ -251,19 +272,7 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     @app.get("/projects/{project_id}/facts/{fact_id}")
     def get_project_fact(project_id: int, fact_id: int) -> dict[str, Any]:
         try:
-            run_state = app.state.dispatcher_runner.status(project_id)
-            if run_state.queued:
-                app.state.dispatcher_runner.stop(project_id)
-            elif run_state.running:
-                raise HTTPException(
-                    status_code=HTTPStatus.CONFLICT,
-                    detail="project dispatcher is running; stop it before deleting the project",
-                )
             project = app.state.store.get_project(project_id)
-            app.state.project_runtime.remove_project_container(project)
-            deleted = app.state.store.delete_project(project_id).to_dict()
-            app.state.workspace.remove(project_id)
-            return deleted
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
         fact = project.facts.get(fact_id)
@@ -434,7 +443,9 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         with app.state.store.project_lock(project_id):
             try:
                 run_state = app.state.dispatcher_runner.status(project_id)
-                if run_state.running:
+                if run_state.queued:
+                    app.state.dispatcher_runner.stop(project_id)
+                elif run_state.running:
                     raise HTTPException(
                         status_code=HTTPStatus.CONFLICT,
                         detail="project dispatcher is running; stop it before deleting the project",
@@ -442,8 +453,12 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 project = app.state.store.get_project(project_id)
                 if project.status.value == "running":
                     raise ProjectConflictError("stop the project before deleting it")
-                app.state.project_runtime.remove_project_container(project)
-                return app.state.store.delete_project(project_id).to_dict()
+                remove_container = getattr(app.state.project_runtime, "remove_project_container", None)
+                if callable(remove_container):
+                    remove_container(project)
+                deleted = app.state.store.delete_project(project_id).to_dict()
+                app.state.workspace.remove(project_id)
+                return deleted
             except ProjectNotFoundError as exc:
                 raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
             except DockerRuntimeError as exc:

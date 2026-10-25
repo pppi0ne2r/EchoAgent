@@ -144,6 +144,8 @@ class CryptoCompletionClosureTests(unittest.TestCase):
             runtime = Runtime()
             with patch("echo_agent.server.app.DockerProjectRuntime.from_settings", return_value=runtime):
                 app = create_app(store)
+            # Startup boundary migration may bump the revision; reload before writing.
+            project = store.get_project(7)
             with TestClient(app) as http:
                 self.assertEqual(http.patch("/projects/7/status", json={"status": "completed"}).status_code, 400)
                 completed = copy.deepcopy(project)
@@ -213,15 +215,17 @@ class CryptoCompletionClosureTests(unittest.TestCase):
                 store = SQLiteProjectStore(root / "state.db")
                 project, _, path = project_in(root)
                 store.save_project(project)
+                runtime = Runtime()
+                with patch("echo_agent.server.app.DockerProjectRuntime.from_settings", return_value=runtime):
+                    app = create_app(store)
+                # Startup boundary migration may bump the revision; reload before writing.
+                project = store.get_project(7)
                 if mode == "bytes":
                     path.write_bytes(b"n=55\ne=3\nc=14\n")
                 else:
                     project.crypto["inputs"] = []
-                runtime = Runtime()
                 with self.assertRaises(ValueError):
                     StoreDispatcherClient(store, runtime).save_project(project)
-                with patch("echo_agent.server.app.DockerProjectRuntime.from_settings", return_value=runtime):
-                    app = create_app(store)
                 with TestClient(app) as http:
                     self.assertEqual(http.put("/projects/7", json=project.to_dict()).status_code, 400)
                 self.assertEqual(runtime.transitions, [])

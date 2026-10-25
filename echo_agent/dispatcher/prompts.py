@@ -301,8 +301,8 @@ def _format_worker_context(project: Project) -> str:
         [
             "执行上下文只包含任务信息、已验证证据和已经关闭的动作。",
             "target_url 可以同时包含 URL、IP 和容器内附件路径，不要假定它一定是网页地址。",
-            "closed_actions 只给出 action_key、description、outcome，不包含证伪事实编号。",
-            "不要重做 closed_actions 里的动作，也不要根据缺失的事实编号继续扩展。",
+            "closed_actions 给出已执行动作；密码任务另附 intent id 和结构化参数，不包含证伪事实编号。" if project.task_type == "crypto" else "closed_actions 只给出 action_key、description、outcome，不包含证伪事实编号。",
+            "不要在相同输入、参数和范围内重做 closed_actions；不同范围须明确写出新边界。" if project.task_type == "crypto" else "不要重做 closed_actions 里的动作，也不要根据缺失的事实编号继续扩展。",
             json.dumps(payload, ensure_ascii=False, indent=2),
         ]
     )

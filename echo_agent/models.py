@@ -218,6 +218,7 @@ class Intent:
     note: str = ""
     action_key: str = ""
     to_fact_ids: tuple[int, ...] = ()
+    crypto: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.id < 0:
@@ -347,6 +348,7 @@ class Intent:
             note=str(data.get("note", "")),
             action_key=str(data.get("action_key", "")),
             to_fact_ids=targets,
+            crypto=data.get("crypto", {}),
         )
 
 

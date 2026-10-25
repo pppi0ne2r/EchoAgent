@@ -11,6 +11,7 @@ from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
 from .models import Fact, FactKind, Intent, Project
+from .crypto_contract import input_ref, project_crypto
 
 
 
@@ -162,7 +163,7 @@ class SQLiteProjectStore:
             ).fetchall()
             intent_rows = conn.execute(
                 """
-                SELECT id, from_fact_id, to_fact_id, to_fact_ids, description, status, outcome, note, action_key
+                SELECT id, from_fact_id, to_fact_id, to_fact_ids, description, status, outcome, note, action_key, crypto
                 FROM intents
                 WHERE project_id = ?
                 ORDER BY id
@@ -190,6 +191,7 @@ class SQLiteProjectStore:
                 note=str(row["note"] or ""),
                 action_key=str(row["action_key"] or ""),
                 to_fact_ids=_target_ids(row["to_fact_ids"], _nullable_int(row["to_fact_id"])),
+                crypto=json.loads(row["crypto"] or "{}"),
             )
             for row in intent_rows
         }
@@ -284,6 +286,9 @@ class SQLiteProjectStore:
             conn.execute("DELETE FROM facts WHERE project_id = ?", (project.id,))
             self._insert_facts(conn, project.id, project.facts.values())
             self._insert_intents(conn, project.id, project.intents.values())
+        project.revision = revision
+        project.project_uid = project_uid
+        project.run_owner = run_owner
         if self.after_save is not None:
             self.after_save(project)
         return project
@@ -299,11 +304,26 @@ class SQLiteProjectStore:
         task_type: str = "general",
         crypto: dict[str, Any] | None = None,
     ) -> Project:
-        name = name.strip() if isinstance(name, str) else None
-        if not name:
+        if isinstance(name, str):
+            name = name.strip()
+            if not name:
+                raise ValueError("project name cannot be empty")
+        else:
             name = None
         if isinstance(target_url, str):
             target_url = target_url.strip() or None
+        # Validate before opening the insert transaction, including auto-ID calls.
+        Project(id=project_id if project_id is not None else 0, name=name if name is not None else "pending",
+                docker=docker, target_url=target_url, hint=hint, objective=objective,
+                task_type=task_type, crypto=crypto or {})
+        if task_type not in {"general", "crypto"}:
+            raise ValueError("task_type must be general or crypto")
+        crypto_data = project_crypto(crypto or {})
+        if task_type == "general" and crypto_data:
+            raise ValueError("general projects cannot have crypto metadata")
+        if task_type == "crypto" and not crypto_data:
+            crypto_data = {"schema_version": 1, "inputs": []}
+        crypto_json = json.dumps(crypto_data, ensure_ascii=False)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             project_id = self._reserve_project_id(conn, project_id)
@@ -382,11 +402,15 @@ class SQLiteProjectStore:
         _sync_boundary_facts(project)
         return self.save_project(project)
 
-    def delete_project(self, project_id: int) -> Project:
-        project = self.get_project(project_id)
-        with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-            if cursor.rowcount == 0:
+    def add_crypto_input(self, project_id: int, reference: dict[str, Any]) -> dict[str, Any]:
+        """Register an already written input without rewriting the fact/intent graph."""
+        validated = input_ref(reference)
+        with self.project_lock(project_id), self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT task_type, status, crypto FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if row is None:
                 raise ProjectNotFoundError(project_id)
             if row["task_type"] != "crypto":
                 raise ValueError("inputs can only be uploaded to crypto projects")
@@ -602,9 +626,9 @@ class SQLiteProjectStore:
         conn.executemany(
             """
             INSERT INTO intents (
-                project_id, id, from_fact_id, to_fact_id, to_fact_ids, description, status, outcome, note, action_key
+                project_id, id, from_fact_id, to_fact_id, to_fact_ids, description, status, outcome, note, action_key, crypto
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (

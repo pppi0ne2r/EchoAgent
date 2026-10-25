@@ -152,10 +152,18 @@ class DispatcherRunner:
                 dispatcher.request_stop()
             if thread is not None and thread.is_alive():
                 thread.join(timeout=join_timeout)
-        self._release_idle_project(project_id)
-        state.running = thread is not None and thread.is_alive()
-        state.queued = False
-        self._promote()
+                if thread.is_alive():
+                    self._force_stop_container(project_id)
+                    thread.join(timeout=join_timeout)
+        finally:
+            # A failed cancel/force-stop must still release ownership, otherwise the project
+            # stays "running" and can never be started again.
+            try:
+                self._release_idle_project(project_id)
+            finally:
+                state.running = thread is not None and thread.is_alive()
+                state.queued = False
+                self._promote()
         return state
 
     def stop_all(self) -> list[DispatcherRunState]:
