@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
 import tempfile
@@ -500,6 +501,68 @@ class ToolRepoTests(unittest.TestCase):
                     "https://github.com/hahwul/dalfox/releases/download/v2.12.0/dalfox-linux-arm64.tar.gz",
                 )
             self.assertIn("请改填仓库主页", str(caught.exception))
+
+
+class LocalExtensionImportTests(unittest.TestCase):
+    def test_local_skill_markdown_and_zip_are_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            markdown = b"---\nname: java-deser\ndescription: read gadget chains\n---\n# hi\n"
+            item = catalog.import_local("skill", "SKILL.md", markdown)
+            runtime = DockerProjectRuntime(
+                image="worker:test",
+                context=Path("container"),
+                dockerfile=Path("container/Dockerfile"),
+                resource_root=root / "resources",
+                extensions=catalog,
+            )
+            self.assertEqual(runtime.update_extensions(item_id=item.id), [])
+            installed = root / "resources" / "skills" / "java-deser" / "SKILL.md"
+            self.assertEqual(installed.read_bytes(), markdown)
+
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr("nested-skill/SKILL.md", "---\nname: nested-skill\ndescription: nested\n---\n")
+                archive.writestr("nested-skill/scripts/run.py", "print(1)\n")
+            zipped = catalog.import_local("skill", "nested-skill.zip", payload.getvalue())
+            self.assertEqual(runtime.update_extensions(item_id=zipped.id), [])
+            self.assertTrue((root / "resources" / "skills" / "nested-skill" / "SKILL.md").is_file())
+            self.assertTrue((root / "resources" / "skills" / "nested-skill" / "scripts" / "run.py").is_file())
+
+    def test_invalid_skill_is_rejected_before_it_can_be_missed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            with self.assertRaises(ValueError) as caught:
+                catalog.import_local("skill", "SKILL.md", b"# no frontmatter\n")
+            self.assertIn("不会加载", str(caught.exception))
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr("repo/docs/SKILL.md", "---\nname: too-deep\ndescription: no\n---\n")
+            with self.assertRaises(ValueError) as caught:
+                catalog.import_local("skill", "too-deep.zip", payload.getvalue())
+            self.assertIn("只套一层目录", str(caught.exception))
+            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+
+    def test_local_tool_and_knowledge_files_are_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = ExtensionCatalog(root / "extensions.json", root / "resources")
+            tool = catalog.import_local("tool", "local-helper.jar", b"jar-bytes")
+            knowledge = catalog.import_local("knowledge", "notes.md", b"notes\n")
+            runtime = DockerProjectRuntime(
+                image="worker:test",
+                context=Path("container"),
+                dockerfile=Path("container/Dockerfile"),
+                resource_root=root / "resources",
+                extensions=catalog,
+            )
+            self.assertEqual(runtime.update_extensions(item_id=tool.id), [])
+            self.assertEqual(runtime.update_extensions(item_id=knowledge.id), [])
+            self.assertEqual((root / "resources" / "tools" / "local-helper.jar").read_bytes(), b"jar-bytes")
+            self.assertEqual((root / "resources" / "knowledges" / "notes.md").read_bytes(), b"notes\n")
+            self.assertTrue(tool.url.startswith("file:"))
 
 
 if __name__ == "__main__":

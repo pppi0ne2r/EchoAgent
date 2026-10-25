@@ -2580,6 +2580,29 @@ async function loadExtensions() {
   return items;
 }
 
+async function importExtensionFile(kind, file) {
+  const headers = { "Content-Type": "application/octet-stream" };
+  const token = authToken();
+  if (token) headers["X-Echo-Agent-Token"] = token;
+  const response = await fetch(
+    `/extensions/import?kind=${encodeURIComponent(kind || "")}&filename=${encodeURIComponent(file.name)}`,
+    { method: "POST", headers, body: file },
+  );
+  if (response.status === 401) {
+    const entered = window.prompt("需要访问令牌（X-Echo-Agent-Token）：");
+    if (entered && entered.trim()) {
+      localStorage.setItem("echoAgentToken", entered.trim());
+      return importExtensionFile(kind, file);
+    }
+    throw new Error("unauthorized");
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail || body.error || `${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
 function formatBytes(size) {
   const value = Number(size);
   if (!Number.isFinite(value) || value < 0) return "";
@@ -2650,6 +2673,24 @@ for (const form of els.extensionsPage?.querySelectorAll(".extension-form") || []
     errorNode.textContent = "";
   };
   form.querySelector('input[name="url"]')?.addEventListener("input", clearFormError);
+  form.querySelector('input[name="file"]')?.addEventListener("change", async (event) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    clearFormError();
+    const kind = form.closest(".extension-column")?.dataset.kind;
+    try {
+      await withAction("导入本地文件...", async () => {
+        await importExtensionFile(kind, file);
+        await loadExtensions();
+      });
+    } catch (error) {
+      if (!errorNode) return;
+      errorNode.hidden = false;
+      errorNode.textContent = error.message || "导入失败";
+    }
+  });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     clearFormError();

@@ -41,7 +41,7 @@ from echo_agent.server.schemas import (
     ProjectStatusRequest,
 )
 from echo_agent.server.dispatcher_runner import DispatcherRunner
-from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError
+from echo_agent.server.extensions import MAX_IMPORT_BYTES, ExtensionCatalog, ExtensionResolveError
 from echo_agent.server.writeup import WriteupService
 from echo_agent.storage import ProjectNotFoundError, ProjectConflictError, SQLiteProjectStore
 
@@ -692,6 +692,30 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 item = app.state.extensions.add_from_link(data.kind, link)
         except (ValueError, ExtensionResolveError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        return next(entry for entry in app.state.extensions.public_items(app.state.project_runtime._resource_exists) if entry["id"] == item.id)
+
+    @app.post("/extensions/import", status_code=HTTPStatus.CREATED)
+    async def import_extension(request: Request, kind: str, filename: str) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/octet-stream":
+            raise HTTPException(status_code=HTTPStatus.UNSUPPORTED_MEDIA_TYPE, detail="请以文件内容上传")
+        if request.headers.get("content-length", "").isdigit() and int(request.headers["content-length"]) > MAX_IMPORT_BYTES:
+            raise HTTPException(status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE, detail="文件不能超过 128MB")
+        content = await request.body()
+        if len(content) > MAX_IMPORT_BYTES:
+            raise HTTPException(status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE, detail="文件不能超过 128MB")
+        try:
+            item = app.state.extensions.import_local(kind, filename, content)
+            failures = app.state.project_runtime.update_extensions(item_id=item.id)
+        except KeyError as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="本地导入失败") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+        if failures:
+            try:
+                app.state.extensions.delete(item.id)
+            except KeyError:
+                pass
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=failures[0]["error"])
         return next(entry for entry in app.state.extensions.public_items(app.state.project_runtime._resource_exists) if entry["id"] == item.id)
 
     @app.post("/extensions/update")

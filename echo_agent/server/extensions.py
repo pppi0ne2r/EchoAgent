@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import fnmatch
+import io
 import json
 import re
+import tarfile
 import threading
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -14,6 +17,7 @@ from echo_agent.config import ProjectResource
 
 
 EXTENSION_KINDS = ("knowledge", "tool", "skill")
+MAX_IMPORT_BYTES = 128 * 1024 * 1024
 _YSOSERIAL_URL = "https://github.com/frohoff/ysoserial/releases/download/v0.0.6/ysoserial-all.jar"
 _ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")
 
@@ -203,10 +207,18 @@ class ExtensionCatalog:
         *,
         github_repo: str = "",
         asset_pattern: str = "",
+        local_file: Path | None = None,
     ) -> ExtensionItem:
         cleaned_kind = kind.strip()
         cleaned_name = _clean_name(name)
-        cleaned_url = _clean_url(url)
+        if local_file is None:
+            cleaned_url = _clean_url(url)
+        else:
+            path = local_file.resolve()
+            root = self.resource_root.resolve()
+            if not path.is_file() or root not in path.parents:
+                raise ValueError("本地文件无效")
+            cleaned_url = path.as_uri()
         if cleaned_kind not in EXTENSION_KINDS:
             raise ValueError("kind must be knowledge, tool, or skill")
         with self._lock:
@@ -243,6 +255,31 @@ class ExtensionCatalog:
         url = _clean_url(text)
         _reject_webpage_link(url)
         return self.add(cleaned_kind, name_from_download_url(url), url)
+
+    def import_local(self, kind: str, filename: str, content: bytes) -> ExtensionItem:
+        cleaned_kind = kind.strip()
+        if cleaned_kind not in EXTENSION_KINDS:
+            raise ValueError("kind must be knowledge, tool, or skill")
+        safe_name = _safe_upload_name(filename)
+        if not content:
+            raise ValueError("文件是空的")
+        if len(content) > MAX_IMPORT_BYTES:
+            raise ValueError("文件不能超过 128MB")
+        if cleaned_kind == "skill":
+            skill_text = _skill_text_from_upload(safe_name, content)
+            message = _skill_markdown_error(skill_text)
+            if message:
+                raise ValueError(message)
+            display_name = _frontmatter_field(_frontmatter_block(skill_text), "name")
+        else:
+            display_name = _local_name_from_filename(safe_name)
+        cleaned_name = _clean_name(display_name)
+        if any(item.kind == cleaned_kind and item.name == cleaned_name for item in self.list_items()):
+            raise ValueError(f"{cleaned_name} already exists")
+        destination = self.resource_root / "imports" / cleaned_kind / _slug(cleaned_name) / safe_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        return self.add(cleaned_kind, cleaned_name, "", local_file=destination)
 
     def delete(self, item_id: str) -> None:
         with self._lock:
@@ -546,6 +583,109 @@ def _clean_url(url: str) -> str:
     if not cleaned.startswith(("http://", "https://")) or any(char in cleaned for char in "\n\r "):
         raise ValueError("请填写 http 或 https 链接")
     return cleaned
+
+
+def _safe_upload_name(filename: str) -> str:
+    name = Path(filename.replace("\\", "/")).name.strip()
+    if not name or name in {".", ".."} or any(ord(char) < 32 for char in name) or len(name) > 120:
+        raise ValueError("文件名无效")
+    return name
+
+
+def _local_name_from_filename(filename: str) -> str:
+    lower = filename.lower()
+    stem = filename
+    for suffix in (".tar.gz", ".tar.bz2", ".tbz2", ".tgz"):
+        if lower.endswith(suffix):
+            stem = filename[: -len(suffix)]
+            break
+    else:
+        stem = Path(filename).stem or filename
+    stem = stem.strip(".-_ ")[:80].rstrip(".-_ ")
+    return stem or Path(filename).name
+
+
+def _skill_text_from_upload(filename: str, content: bytes) -> str:
+    lower = filename.lower()
+    if lower.endswith(".md"):
+        return content.decode("utf-8", errors="replace")
+    if lower.endswith(".zip"):
+        return _skill_text_from_zip(content)
+    if lower.endswith((".tar.gz", ".tgz")):
+        return _skill_text_from_tar(content)
+    raise ValueError("Skill 只接受 SKILL.md、zip 或 tar.gz")
+
+
+def _skill_text_from_zip(content: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = [info.filename for info in archive.infolist() if not info.is_dir()]
+            member = _skill_archive_member(names)
+            data = archive.read(member)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("这不是有效的 zip") from exc
+    return _decode_skill_markdown(data)
+
+
+def _skill_text_from_tar(content: bytes) -> str:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:*") as archive:
+            members = [member for member in archive.getmembers() if member.isfile()]
+            member_name = _skill_archive_member([member.name for member in members])
+            chosen = next(member for member in members if member.name == member_name)
+            source = archive.extractfile(chosen)
+            if source is None:
+                raise ValueError("压缩包里的 SKILL.md 无法读取")
+            data = source.read()
+    except (tarfile.TarError, OSError) as exc:
+        raise ValueError("这不是有效的 tar.gz") from exc
+    return _decode_skill_markdown(data)
+
+
+def _decode_skill_markdown(data: bytes) -> str:
+    if len(data) > 1_000_000:
+        raise ValueError("SKILL.md 过大")
+    return data.decode("utf-8", errors="replace")
+
+
+def _skill_archive_member(names: list[str]) -> str:
+    files = [name for name in names if name and not name.endswith("/")]
+    prefix = _single_archive_prefix(files)
+    for name in files:
+        relative = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        relative = relative.removeprefix("./")
+        if relative == "SKILL.md":
+            return name
+    raise ValueError("压缩包里的 SKILL.md 必须在根目录，或只套一层目录。Codex 只读取这一层")
+
+
+def _single_archive_prefix(names: list[str]) -> str:
+    roots = {name.split("/", 1)[0] for name in names if "/" in name}
+    if len(roots) != 1:
+        return ""
+    root = next(iter(roots))
+    if all(name == root or name.startswith(f"{root}/") for name in names):
+        return f"{root}/"
+    return ""
+
+
+def _frontmatter_block(text: str) -> str:
+    match = re.match(r"^---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", text.lstrip("\ufeff"), re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def _frontmatter_field(block: str, key: str) -> str:
+    for line in block.splitlines():
+        if line.startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip().strip("\"\"'")
+    return ""
+
+
+def _skill_markdown_error(text: str) -> str | None:
+    block = _frontmatter_block(text)
+    if not block or not _frontmatter_field(block, "name") or not _frontmatter_field(block, "description"):
+        return "SKILL.md 必须在开头包含 name 和 description，否则 Codex 不会加载"
+    return None
 
 
 def name_from_download_url(url: str) -> str:

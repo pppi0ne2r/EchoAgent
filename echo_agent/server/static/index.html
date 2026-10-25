@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EchoAgent Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=35" />
+    <link rel="stylesheet" href="/static/styles.css?v=36" />
   </head>
   <body>
     <header class="topbar">
@@ -49,10 +49,11 @@
             <h2>知识库</h2>
             <button class="ghost-button extension-update-all" type="button" data-kind="knowledge">全部更新</button>
           </div>
-          <p class="extension-note">只填文件直链，不要填名称，也不要填仓库主页。GitHub 用 archive 链接，例如 https://github.com/owner/repo/archive/refs/heads/main.zip。名称自动取仓库名或文件名。已有容器可以直接使用。</p>
+          <p class="extension-note">可以填文件直链，或本地导入文件、zip。不要填名称，也不要填仓库主页。GitHub 用 archive 链接，例如 https://github.com/owner/repo/archive/refs/heads/main.zip。名称自动取仓库名或文件名。已有容器可以直接使用。</p>
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://github.com/owner/repo/archive/refs/heads/main.zip" required />
             <button type="submit">添加</button>
+            <label class="extension-import">本地导入<input name="file" type="file" hidden /></label>
             <p class="extension-form-error" hidden></p>
           </form>
           <div class="extension-list"></div>
@@ -62,10 +63,11 @@
             <h2>工具库</h2>
             <button class="ghost-button extension-update-all" type="button" data-kind="tool">全部更新</button>
           </div>
-          <p class="extension-note">只填 GitHub 仓库链接，不要填名称，也不要填 release 压缩包。例如 https://github.com/projectdiscovery/katana。名称用仓库名，并下载最新 linux/arm64 资源。已有容器可以直接使用。</p>
+          <p class="extension-note">可以填 GitHub 仓库链接，或本地导入二进制、jar、zip。不要填名称，也不要填 release 压缩包。例如 https://github.com/projectdiscovery/katana。名称用仓库名，并下载最新 linux/arm64 资源。已有容器可以直接使用。</p>
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://github.com/projectdiscovery/katana" required />
             <button type="submit">添加</button>
+            <label class="extension-import">本地导入<input name="file" type="file" hidden /></label>
             <p class="extension-form-error" hidden></p>
           </form>
           <div class="extension-list"></div>
@@ -75,10 +77,11 @@
             <h2>Skill</h2>
             <button class="ghost-button extension-update-all" type="button" data-kind="skill">全部更新</button>
           </div>
-          <p class="extension-note">只填 SKILL.md 或 zip 的直链，不要填名称。例如 https://example.com/java-deser/SKILL.md。名称取上一级目录或文件名，挂到 /home/kali/.agents/skills。已有容器可以直接使用。</p>
+          <p class="extension-note">可以填 SKILL.md 或 zip 直链，或本地导入。SKILL.md 开头必须有 name 和 description，zip 里的 SKILL.md 只能在根目录或套一层目录。Codex 会读取 /home/kali/.agents/skills。已有容器可以直接使用。</p>
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://example.com/java-deser/SKILL.md" required />
             <button type="submit">添加</button>
+            <label class="extension-import">本地导入<input name="file" type="file" accept=".md,.zip,.tar.gz,.tgz" hidden /></label>
             <p class="extension-form-error" hidden></p>
           </form>
           <div class="extension-list"></div>
@@ -290,6 +293,6 @@
       </form>
     </section>
 
-    <script src="/static/app.js?v=42"></script>
+    <script src="/static/app.js?v=43"></script>
   </body>
 </html>
