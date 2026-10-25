@@ -163,6 +163,11 @@ class SystemProxyCommandTests(unittest.TestCase):
         self.assertIn("--build-arg", build_command)
         self.assertIn("https_proxy=http://echo-agent-host:7890", build_command)
         self.assertIn("echo-agent-host:host-gateway", build_command)
+        self.assertIn("--entrypoint", run_command)
+        entrypoint_at = run_command.index("--entrypoint")
+        self.assertEqual(run_command[entrypoint_at:entrypoint_at + 4], [
+            "--entrypoint", "/opt/echo-agent/entrypoint.sh", "worker:test", "sleep",
+        ])
 
     def test_container_commands_stay_unchanged_without_proxy(self) -> None:
         runtime = DockerProjectRuntime(
@@ -220,6 +225,29 @@ class SystemProxyCommandTests(unittest.TestCase):
 
         self.assertEqual(commands[0][:3], ["docker", "rm", "-f"])
         self.assertEqual(commands[1][:2], ["docker", "run"])
+
+    def test_stopped_container_is_recreated_when_proxy_changes(self) -> None:
+        runtime = DockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+        )
+        project = type("ProjectStub", (), {"docker": "echo-agent-task-7", "task_type": "general"})()
+        commands: list[list[str]] = []
+
+        def run(_runtime: DockerProjectRuntime, command: list[str], **_: object) -> None:
+            commands.append(command)
+
+        with (
+            patch.object(DockerProjectRuntime, "_container_state", return_value="exited"),
+            patch.object(DockerProjectRuntime, "_proxy_configuration_changed", return_value=True),
+            patch.object(DockerProjectRuntime, "ensure_project_container") as ensure,
+            patch.object(DockerProjectRuntime, "_run", run),
+        ):
+            runtime.start_project_container(project)  # type: ignore[arg-type]
+
+        self.assertEqual(commands[0][:3], ["docker", "rm", "-f"])
+        ensure.assert_called_once()
 
 
 if __name__ == "__main__":

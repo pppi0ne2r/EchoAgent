@@ -259,7 +259,7 @@ class DockerProjectRuntime:
         for host_path, container_path, read_only in mounts:
             mode = "ro" if read_only else "rw"
             command.extend(["-v", f"{host_path}:{container_path}:{mode}"])
-        command.extend([self.image, *self.keepalive_command])
+        command.extend(["--entrypoint", "/opt/echo-agent/entrypoint.sh", self.image, *self.keepalive_command])
         return command
 
     def start_project_container(self, project: Project, log: DockerLogCallback | None = None) -> None:
@@ -270,6 +270,11 @@ class DockerProjectRuntime:
             self.ensure_project_container(project, log=log)
             return
         if state != "running":
+            if self._proxy_configuration_changed(container):
+                self._log(log, "docker container recreate started for proxy configuration", docker=container)
+                self.remove_project_container(project, log=log)
+                self.ensure_project_container(project, log=log)
+                return
             self._log(log, "docker container start started", docker=container, previous_state=state)
             self._run(["docker", "start", container], log=log, output_prefix="docker start")
             self._log(log, "docker container start finished", docker=container)
