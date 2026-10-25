@@ -328,7 +328,15 @@ def _optional_str(value: object) -> str | None:
 
 def _optional_answer(value: object) -> str | None:
     text = _optional_str(value)
-    if text in {"真实 flag 字符串", "实际获得的完整 flag", "实际获得的完整 flag；不要照抄本句", "最终答案", "answer"}:
+    if text in {
+        "真实 flag 字符串",
+        "实际获得的完整 flag",
+        "实际获得的完整 flag；不要照抄本句",
+        "满足目的的结论",
+        "满足目的的结论；不要照抄本句",
+        "最终答案",
+        "answer",
+    }:
         return None
     return text
 

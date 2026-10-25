@@ -22,6 +22,8 @@ class FirstRunPromptTests(unittest.TestCase):
 
         self.assertIn("本次执行只输出一条 JSON", prompt)
         self.assertIn("可以输出多条", prompt)
+        self.assertIn("创建项目时填写的目的", prompt)
+        self.assertNotIn("得到 flag", prompt)
         self.assertNotIn("同一次执行可以输出多个 JSON", prompt)
         self.assertNotIn("结束时再输出最后一个总结", prompt)
         self.assertIn('"fact_description"', prompt)
@@ -32,6 +34,8 @@ class FirstRunPromptTests(unittest.TestCase):
         prompt = PromptBuilder().build_explore_prompt(project, intent)  # type: ignore[arg-type]
 
         self.assertIn("只执行给定 intent", prompt)
+        self.assertIn("当前 intent 已经满足目的", prompt)
+        self.assertNotIn("直接得到 flag", prompt)
         self.assertIn('"fact_description"', prompt)
 
 
