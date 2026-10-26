@@ -73,12 +73,17 @@ RUN printf '%s\n' 'PS1="${PS1%\\n*} \[\033[0;36m\]\D{%y-%m-%d} - \t\[\033[;32m\]
 ENV TZ=Asia/Shanghai
 ENV PYTHONUNBUFFERED=1
 
-# Media/forensics tools live in a final layer so the existing toolchain stays cached.
+# Extra tools live in a final layer so the existing toolchain stays cached.
 USER root
 RUN apt update && \
     apt install -y --no-install-recommends \
       binutils \
-      ffmpeg && \
+      ffmpeg \
+      python3-pwntools \
+      python3-pyelftools && \
+    python3 -c "import pwn, elftools" && \
+    command -v objdump >/dev/null && \
+    command -v readelf >/dev/null && \
     apt clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 USER kali
