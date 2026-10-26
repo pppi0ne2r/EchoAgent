@@ -64,6 +64,25 @@ class FailingWorker:
         raise RuntimeError("agent stalled")
 
 
+class CountingReasoner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan(self, project: Project) -> ReasonResult:
+        self.calls += 1
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 0,
+                    "to": None,
+                    "action_key": "list-files",
+                    "description": "只列出附件文件名",
+                }
+            ],
+        )
+
+
 class OrderedConcurrentWorker:
     def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
         if intent.id == 0:
@@ -191,12 +210,47 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         saved = client.project
         self.assertEqual(result.mode, DispatchMode.FIRST_RUN)
-        self.assertNotIn(2, saved.facts)
+        self.assertTrue(result.halt)
+        self.assertEqual(saved.facts[2].kind, FactKind.ERROR)
+        self.assertIn("first-run execution failed", saved.facts[2].description)
         self.assertEqual(saved.intents[0].status.value, "failed")
         self.assertEqual(saved.intents[0].outcome.value, "error")
         self.assertEqual(saved.intents[0].from_fact_id, 0)
+        self.assertEqual(saved.intents[0].to_fact_id, 2)
         self.assertIn("first-run execution failed", saved.intents[0].note)
         self.assertEqual(saved.status, ProjectStatus.STOPED)
+
+    def test_failed_first_run_does_not_plan_until_the_next_run(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            target_url="http://target",
+            objective="get flag",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        reasoner = CountingReasoner()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=FailingWorker(),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=5)
+
+        self.assertEqual([result.mode for result in results], [DispatchMode.FIRST_RUN])
+        self.assertTrue(results[0].halt)
+        self.assertEqual(reasoner.calls, 0)
+        self.assertEqual(client.project.facts[2].kind, FactKind.ERROR)
+        self.assertEqual(client.project.status, ProjectStatus.STOPED)
+
+        follow_up = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(follow_up.mode, DispatchMode.REASON)
+        self.assertEqual(reasoner.calls, 1)
+        self.assertEqual(client.project.intents[1].from_fact_id, 0)
 
     def test_no_output_timeout_failure_fact_is_actionable(self) -> None:
         fact = Dispatcher._execution_failed_fact(

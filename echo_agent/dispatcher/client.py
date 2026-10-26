@@ -31,6 +31,9 @@ class ProjectClient:
     def get_project(self, project_id: int) -> Project:
         return Project.from_dict(self._request("GET", f"/projects/{project_id}"))
 
+    def add_token_usage(self, project_id: int, usage: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/projects/{project_id}/token-usage", usage)
+
     def get_fact(self, project_id: int, fact_id: int) -> dict[str, Any]:
         return self._request("GET", f"/projects/{project_id}/facts/{fact_id}")
 

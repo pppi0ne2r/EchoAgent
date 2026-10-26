@@ -77,7 +77,7 @@
             <h2>Skill</h2>
             <button class="ghost-button extension-update-all" type="button" data-kind="skill">全部更新</button>
           </div>
-          <p class="extension-note">可以填 GitHub 仓库主页，例如 https://github.com/ljagiello/ctf-skills。会下载默认分支，并把根目录或每个一级子目录里的 SKILL.md 分别添加。也可以填 SKILL.md、单个 skill 的 zip 直链，或本地导入。单个 zip 的 SKILL.md 只能在根目录或套一层目录，开头必须有 name 和 description。Codex 会读取 /home/kali/.agents/skills。已有容器可以直接使用。</p>
+          <p class="extension-note">https://github.com/ljagiello/ctf-skills 是内置预设，首次启动会自动导入。也可以再填其他 GitHub 仓库主页。会下载默认分支，并把根目录或每个一级子目录里的 SKILL.md 分别添加。也可以填 SKILL.md、单个 skill 的 zip 直链，或本地导入。单个 zip 的 SKILL.md 只能在根目录或套一层目录，开头必须有 name 和 description。Codex 会读取 /home/kali/.agents/skills。已有容器可以直接使用。</p>
           <form class="extension-form">
             <input name="url" type="url" placeholder="https://github.com/ljagiello/ctf-skills" required />
             <button type="submit">添加</button>
@@ -108,10 +108,10 @@
             <p id="project-subtitle">查看任务输入、fact / intent 图和运行状态</p>
           </div>
           <div class="actions">
+            <button id="reset-project" type="button" disabled>清空进度</button>
             <button id="edit-project" type="button" disabled>编辑</button>
             <button id="run-project" type="button" disabled>运行</button>
             <button id="stop-project" type="button" disabled>停止</button>
-            <button id="reset-project" type="button" disabled>清空进度</button>
             <button id="delete-project" class="danger" type="button" disabled>删除</button>
           </div>
         </div>
@@ -121,6 +121,7 @@
           <div><span>目标</span><strong>-</strong></div>
           <div><span>图</span><strong>-</strong></div>
           <div><span>调度</span><strong>-</strong></div>
+          <div><span>Token</span><strong>-</strong><em id="token-breakdown"></em></div>
         </div>
         <div id="crypto-inputs" class="crypto-inputs" hidden>
           <strong id="crypto-input-title">输入清单</strong>
@@ -172,6 +173,7 @@
           </div>
         </div>
         <div id="run-status-bar" class="run-status-bar">未选择项目</div>
+        <div id="token-mode-line" class="token-mode-line" hidden></div>
         <div id="log-list" class="log-list"></div>
       </aside>
     </main>

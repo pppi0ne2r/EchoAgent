@@ -12,6 +12,12 @@ from collections import deque
 from typing import Mapping, Sequence
 
 from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, CryptoBudget, resolve_crypto_budget
+from echo_agent.dispatcher.token_usage import (
+    SESSION_READER_SCRIPT,
+    parse_tokens_used_total,
+    usage_from_session_payload,
+    usage_from_text_total,
+)
 from echo_agent.dispatcher.parsing import (
     ReasonFormatError,
     extract_mode_json_output,
@@ -156,6 +162,7 @@ class CodexDockerAgent:
         self._run_state = threading.local()
         self._crypto_containers: set[str] = set()
         self._cancelled_containers: set[str] = set()
+        self.on_token_usage = None
 
     def run(
         self,
@@ -176,6 +183,9 @@ class CodexDockerAgent:
             if crypto_worker else None
         )
         self._run_state.limit_reason = None
+        self._run_state.usage_captured = False
+        self._run_state.token_usage = None
+        self._run_state.stderr_lines = []
         if crypto_worker:
             with self._process_lock:
                 self._crypto_containers.add(project.docker)
@@ -206,14 +216,18 @@ class CodexDockerAgent:
             output = self._run_process(command, prompt, mode, env=env, log=log)
             self._log(log, f"codex agent process finished in {mode.value} mode", metadata={"output_chars": len(output)})
             state = self._run_state
+            usage = self._capture_token_usage(project, mode, intent_id, runtime_key, log)
             return AgentRunResult(
                 output=output,
                 salvaged=bool(getattr(state, "salvaged", False)),
                 timed_out=bool(getattr(state, "timed_out", False)),
                 raw_output=str(getattr(state, "raw_output", "") or output),
                 limit_reason=getattr(state, "limit_reason", None),
+                token_usage=usage,
             )
         finally:
+            if not getattr(self._run_state, "usage_captured", False):
+                self._capture_token_usage(project, mode, intent_id, runtime_key, log)
             try:
                 if crypto_worker:
                     with self._process_lock:
@@ -454,6 +468,7 @@ class CodexDockerAgent:
 
         output_lines: list[str] = []
         stderr_lines: list[str] = []
+        self._run_state.stderr_lines = stderr_lines
         recent_output: deque[str] = deque(maxlen=40)
         stdout_log_lines: list[str] = []
         stderr_log_lines: list[str] = []
@@ -773,6 +788,75 @@ class CodexDockerAgent:
             raise RuntimeError(f"codex agent failed in {mode.value} mode with exit code {return_code}: {detail}")
         self._remember_run(salvaged=False, timed_out=False, raw_output=output)
         return output
+
+    def _capture_token_usage(
+        self,
+        project: Project,
+        mode: DispatchMode,
+        intent_id: int | None,
+        runtime_key: str | None,
+        log: AgentLogCallback | None,
+    ) -> dict[str, object] | None:
+        if getattr(self._run_state, "usage_captured", False):
+            usage = getattr(self._run_state, "token_usage", None)
+            return usage if isinstance(usage, dict) else None
+        self._run_state.usage_captured = True
+        model = self.mode_models.get(mode.value) or self.model or ""
+        usage = None
+        try:
+            if runtime_key:
+                sessions = f"{self.runtime_paths(runtime_key)[0]}/sessions"
+                raw = self._read_session_usage(project, sessions)
+                usage = usage_from_session_payload(raw, mode=mode.value, intent_id=intent_id, model=model)
+            if usage is None:
+                usage = usage_from_text_total(
+                    parse_tokens_used_total(self._stderr_text()),
+                    mode=mode.value,
+                    intent_id=intent_id,
+                    model=model,
+                )
+        except Exception as exc:
+            self._log(log, f"token usage was not recorded: {type(exc).__name__}: {exc}", "warning")
+            usage = None
+        self._run_state.token_usage = usage
+        self._emit_token_usage(project.id, usage, log)
+        return usage
+
+    def _emit_token_usage(self, project_id: int, usage: dict[str, object] | None, log: AgentLogCallback | None) -> None:
+        sink = getattr(self, "on_token_usage", None)
+        if usage is None or not callable(sink):
+            return
+        try:
+            sink(project_id, usage)
+        except Exception as exc:
+            self._log(log, f"token usage was not saved: {type(exc).__name__}: {exc}", "warning")
+
+    def _stderr_text(self) -> str:
+        lines = getattr(self._run_state, "stderr_lines", None) or []
+        return "\n".join(str(line) for line in lines).strip()
+
+    def _read_session_usage(self, project: Project, sessions_dir: str) -> dict[str, object] | None:
+        if not project.docker:
+            return None
+        completed = subprocess.run(
+            ["docker", "exec", "-i", project.docker, "python3", "-", sessions_dir],
+            input=SESSION_READER_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=self._subprocess_env(),
+        )
+        if completed.returncode != 0:
+            return None
+        line = completed.stdout.strip().splitlines()
+        if not line:
+            return None
+        try:
+            payload = json.loads(line[-1])
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _remember_run(self, *, salvaged: bool, timed_out: bool, raw_output: str,
                       limit_reason: str | None = None) -> None:

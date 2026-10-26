@@ -23,6 +23,7 @@ const state = {
   showDetailLogs: false,
   writeupStatus: null,
   writeupTimer: null,
+  tokenUsage: null,
 };
 
 const els = {
@@ -47,6 +48,8 @@ const els = {
   logsPanel: document.querySelector(".logs-panel"),
   logs: document.querySelector("#log-list"),
   runStatusBar: document.querySelector("#run-status-bar"),
+  tokenBreakdown: document.querySelector("#token-breakdown"),
+  tokenModeLine: document.querySelector("#token-mode-line"),
   showDetailLogs: document.querySelector("#show-detail-logs"),
   stopAll: document.querySelector("#stop-all"),
   openCreate: document.querySelector("#open-create"),
@@ -208,10 +211,22 @@ async function refreshCurrent() {
   state.currentProject = await api(`/projects/${state.currentProjectId}`);
   state.runStatus = await api(`/projects/${state.currentProjectId}/run`);
   state.runs = await api("/projects/runs");
+  await loadTokenUsage().catch(() => {});
   await refreshWriteupStatus();
   renderCurrentProject();
   await loadLogs();
   await refreshProjectsOnly();
+}
+
+async function loadTokenUsage() {
+  if (!state.currentProjectId) return;
+  const projectId = state.currentProjectId;
+  const usage = await api(`/projects/${projectId}/token-usage`);
+  if (state.currentProjectId !== projectId) return;
+  const previous = state.tokenUsage?.total_tokens;
+  state.tokenUsage = usage;
+  renderTokenSummary();
+  if (previous !== usage?.total_tokens && !state.showDetailLogs) paintLogs();
 }
 
 async function refreshProjectsOnly() {
@@ -240,8 +255,9 @@ function renderCurrentProject() {
     state.runStatus?.queued ? "queued" : state.runStatus?.running ? "running" : "idle",
   ];
   [...els.summary.querySelectorAll("strong")].forEach((node, index) => {
-    node.textContent = values[index];
+    if (index < values.length) node.textContent = values[index];
   });
+  renderTokenSummary();
   updateActionButtons();
   drawGraph(project);
   renderGraphDetail(project);
@@ -761,7 +777,103 @@ function answerBasisFactId(answer) {
 function phaseTitle(phase) {
   const name = phase.kind === "first" ? "首次执行" : phase.kind === "reason" ? "推理" : phase.kind === "writeup" ? "撰写 WP" : "探索";
   const status = phase.status === "done" ? "已完成" : phase.status === "stopped" ? "已停止" : "进行中";
-  return `${name} · ${status}`;
+  const title = `${name} · ${status}`;
+  if (!phase.done) return title;
+  const total = sumTokenRuns(phaseTokenRuns(phase));
+  return total ? `${title} · ${formatTokenCount(total)} token` : title;
+}
+
+function formatTokenCount(value) {
+  return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function formatWan(value) {
+  const number = Number(value) || 0;
+  if (number < 10000) return formatTokenCount(number);
+  const wan = number / 10000;
+  const text = wan >= 100 ? String(Math.round(wan)) : wan.toFixed(1).replace(/\.0$/, "");
+  return `${text} 万`;
+}
+
+function tokenModeName(mode) {
+  if (mode === "first_run") return "首次执行";
+  if (mode === "explore") return "探索";
+  if (mode === "reason") return "推理";
+  if (mode === "writeup") return "撰写 WP";
+  return mode;
+}
+
+function phaseTokenMode(kind) {
+  if (kind === "first") return "first_run";
+  if (kind === "reason") return "reason";
+  if (kind === "writeup") return "writeup";
+  return "explore";
+}
+
+function phaseTokenRuns(phase) {
+  const runs = Array.isArray(state.tokenUsage?.runs) ? state.tokenUsage.runs : [];
+  const start = parseLogTime(phase.startedAt);
+  if (start === null) return [];
+  const end = phase.endedAt ? parseLogTime(phase.endedAt) : Date.now();
+  const endMs = end === null ? Date.now() : end;
+  const mode = phaseTokenMode(phase.kind);
+  return runs.filter((run) => {
+    if (run.mode !== mode) return false;
+    const at = parseLogTime(run.created_at);
+    return at !== null && at >= start && at <= endMs + 2000;
+  });
+}
+
+function sumTokenRuns(runs) {
+  return runs.reduce((sum, run) => sum + (Number(run.total_tokens) || 0), 0);
+}
+
+function renderTokenSummary() {
+  const nodes = [...els.summary.querySelectorAll("strong")];
+  const tokenNode = nodes[4];
+  const usage = state.tokenUsage;
+  if (!tokenNode) return;
+  if (!state.currentProjectId) {
+    tokenNode.textContent = "-";
+    if (els.tokenBreakdown) els.tokenBreakdown.textContent = "";
+    renderTokenModeLine();
+    return;
+  }
+  if (!usage || !usage.total_tokens) {
+    tokenNode.textContent = "未统计";
+    if (els.tokenBreakdown) els.tokenBreakdown.textContent = "";
+    renderTokenModeLine();
+    return;
+  }
+  tokenNode.textContent = formatWan(usage.total_tokens);
+  const hasSplit = ["input_tokens", "output_tokens", "reasoning_output_tokens", "cached_input_tokens"]
+    .some((key) => Number(usage[key]) > 0);
+  if (els.tokenBreakdown) {
+    els.tokenBreakdown.textContent = hasSplit
+      ? `输入 ${formatWan(usage.input_tokens)} · 输出 ${formatWan(usage.output_tokens)} · 推理 ${formatWan(usage.reasoning_output_tokens)} · 缓存 ${formatWan(usage.cached_input_tokens)}`
+      : "";
+  }
+  renderTokenModeLine();
+}
+
+function renderTokenModeLine() {
+  const line = els.tokenModeLine;
+  if (!line) return;
+  const byMode = state.tokenUsage?.by_mode || {};
+  const order = ["first_run", "explore", "reason", "writeup"];
+  const extras = Object.keys(byMode).filter((mode) => !order.includes(mode));
+  const parts = [...order, ...extras].flatMap((mode) => {
+    const bucket = byMode[mode];
+    if (!bucket || !bucket.total_tokens) return [];
+    return [`${tokenModeName(mode)} ${formatWan(bucket.total_tokens)}`];
+  });
+  if (!state.currentProjectId || !parts.length) {
+    line.hidden = true;
+    line.textContent = "";
+    return;
+  }
+  line.hidden = false;
+  line.textContent = `Token · ${parts.join(" · ")}`;
 }
 
 function intentResultText(intent, phaseDone) {
@@ -778,6 +890,12 @@ function intentResultText(intent, phaseDone) {
   if (intent.legacyFacts) return `intent #${intent.id} 得到新节点`;
   if (intent.finished || phaseDone) return `intent #${intent.id} 未得到新事实`;
   return `intent #${intent.id} 进行中`;
+}
+
+function intentTokenText(text, phase, intentId) {
+  const matched = phaseTokenRuns(phase).filter((run) => Number(run.intent_id) === Number(intentId));
+  const total = sumTokenRuns(matched);
+  return total ? `${text} · ${formatTokenCount(total)} token` : text;
 }
 
 function scheduleRows(phase) {
@@ -834,7 +952,7 @@ function scheduleRows(phase) {
         id: `${phase.id}-intent-${intent.id}`,
         role: "child",
         level: intent.retry ? "warning" : intent.failed ? "error" : "info",
-        text: intentResultText(intent, phase.status !== "running"),
+        text: intentTokenText(intentResultText(intent, phase.status !== "running"), phase, intent.id),
       });
     }
   }
@@ -867,6 +985,8 @@ function scheduleNarrative(logs) {
       result: "",
       answer: "",
       stopReason: "",
+      startedAt: log.created_at,
+      endedAt: "",
     };
     phases.push(current);
   }
@@ -887,12 +1007,13 @@ function scheduleNarrative(logs) {
     return row;
   }
 
-  function markStopped(reason) {
+  function markStopped(reason, log) {
     if (!current) return;
     current.status = "stopped";
     current.done = true;
     current.stopReason = reason;
     current.level = "error";
+    if (log?.created_at) current.endedAt = log.created_at;
   }
 
   for (const log of logs) {
@@ -905,11 +1026,12 @@ function scheduleNarrative(logs) {
         current.result = "开始生成 WP";
       } else if (message === "WP 已生成") {
         current.done = true;
+        current.endedAt = log.created_at;
         current.status = "done";
         current.result = "WP 已生成";
         current.level = "success";
       } else {
-        markStopped(message);
+        markStopped(message, log);
       }
       continue;
     }
@@ -934,6 +1056,7 @@ function scheduleNarrative(logs) {
       if (current?.kind !== "reason") start("reason", log);
       touch(log);
       current.done = true;
+      current.endedAt = log.created_at;
       current.status = "done";
       current.plannedCount = Number(planned[1]);
       current.plannedIntents = intentNumberList(metadata, "intent_ids");
@@ -943,6 +1066,7 @@ function scheduleNarrative(logs) {
       if (current?.kind !== "reason") start("reason", log);
       touch(log);
       current.done = true;
+      current.endedAt = log.created_at;
       current.status = "done";
       current.answer = String(metadata.answer || "");
       current.result = finalResultText(message, metadata);
@@ -956,7 +1080,7 @@ function scheduleNarrative(logs) {
     ) {
       if (!current) start(message.startsWith("target") ? "explore" : "reason", log);
       touch(log);
-      markStopped(finalResultText(message, metadata));
+      markStopped(finalResultText(message, metadata), log);
       continue;
     }
     if (message === "first-run initial intent started" || /^explore started with \d+ active intents$/.test(message)) {
@@ -1001,6 +1125,7 @@ function scheduleNarrative(logs) {
       }
       if (message === "first-run finished") {
         current.done = true;
+        current.endedAt = log.created_at;
         if (current.status === "running") current.status = "done";
       }
       continue;
@@ -1009,12 +1134,14 @@ function scheduleNarrative(logs) {
       if (current?.kind !== "explore") start("explore", log);
       touch(log);
       current.done = true;
+      current.endedAt = log.created_at;
       if (current.status === "running") current.status = "done";
       continue;
     }
     if (message === "server dispatcher stopped" && current?.status === "running") {
       current.status = "stopped";
       current.done = true;
+      current.endedAt = log.created_at;
       if (!current.stopReason) current.stopReason = "调度结束";
       current = null;
     }
@@ -1967,6 +2094,7 @@ function scheduleRefresh() {
     renderRunStatus();
     const writeupRunning = state.writeupStatus?.status === "running";
     if (state.busy || !(state.runStatus?.running || state.runStatus?.queued || writeupRunning)) return;
+    loadTokenUsage().catch(() => {});
     loadLogs().catch(() => {});
   }, 2000);
 }
@@ -1997,7 +2125,9 @@ function clearCurrentProject() {
   state.logAfterId = 0;
   state.logFollow = true;
   state.writeupStatus = null;
+  state.tokenUsage = null;
   stopWriteupPoll();
+  renderTokenSummary();
   renderRunStatus();
   updateActionButtons();
 }

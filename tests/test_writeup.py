@@ -127,6 +127,34 @@ class WriteupServiceTests(unittest.TestCase):
         self.assertIn("开始生成 WP", messages)
         self.assertIn("WP 已生成", messages)
 
+    def test_writeup_agent_can_record_token_usage(self) -> None:
+        def agent_factory():
+            class Agent:
+                def run(self, project, prompt, mode, log=None, intent_id=None, runtime_key=None):
+                    self.on_token_usage(project.id, {
+                        "mode": "writeup",
+                        "intent_id": None,
+                        "model": "grok-4.7",
+                        "session_id": "wp-1",
+                        "input_tokens": 15,
+                        "cached_input_tokens": 5,
+                        "output_tokens": 4,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 19,
+                        "source": "session",
+                    })
+                    (workspace.work_dir(project) / "writeup.md").write_text("ok\n", encoding="utf-8")
+
+            return Agent()
+
+        directory, service, workspace, store, project, _runtime = self._service(agent_factory)
+        with directory:
+            service.start(project.id)
+            service._threads[project.id].join(5)
+            summary = store.token_usage_summary(project.id)
+        self.assertEqual(summary["total_tokens"], 19)
+        self.assertEqual(summary["by_mode"]["writeup"]["cached_input_tokens"], 5)
+
     def test_nested_writeup_path_is_accepted(self) -> None:
         def agent_factory():
             class Agent:

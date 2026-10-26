@@ -525,7 +525,7 @@ class DispatcherRunner:
                 )
                 if result.mode.value == "completed":
                     project_completed = True
-                if result.mode.value in {"completed", "skipped"}:
+                if result.halt or result.mode.value in {"completed", "skipped"}:
                     break
                 if step_consumes_budget(result) and max_steps is not None and steps >= max_steps:
                     if step_requests_trailing_explore(result) and not stop_event.is_set():
@@ -635,6 +635,9 @@ class StoreDispatcherClient:
 
     def get_project(self, project_id: int) -> Project:
         return self.store.get_project(project_id)
+
+    def add_token_usage(self, project_id: int, usage: dict) -> dict | None:
+        return self.store.add_token_usage(project_id, usage)
 
     def verify_crypto_artifact(self, project_id: int, reference: dict) -> None:
         if self.store.get_project(project_id).task_type != "crypto":

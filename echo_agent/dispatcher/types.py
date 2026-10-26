@@ -60,6 +60,7 @@ class DispatchResult:
     mode: DispatchMode
     status: ProjectStatus
     message: str = ""
+    halt: bool = False
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -81,6 +82,7 @@ class AgentRunResult:
     timed_out: bool = False
     raw_output: str = ""
     limit_reason: str | None = None
+    token_usage: dict[str, Any] | None = None
 
 
 AgentLogCallback = Callable[[str, str, dict[str, object] | None], None]

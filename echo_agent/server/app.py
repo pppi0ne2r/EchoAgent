@@ -682,6 +682,23 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
         except ProjectNotFoundError as exc:
             raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
 
+    @app.get("/projects/{project_id}/token-usage")
+    def get_token_usage(project_id: int) -> dict[str, Any]:
+        try:
+            return app.state.store.token_usage_summary(project_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+
+    @app.post("/projects/{project_id}/token-usage")
+    def add_token_usage(project_id: int, usage: dict[str, Any]) -> dict[str, Any]:
+        try:
+            saved = app.state.store.add_token_usage(project_id, usage)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="project not found") from exc
+        if saved is None:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="invalid token usage")
+        return saved
+
     @app.get("/projects/{project_id}/writeup")
     def get_writeup(project_id: int) -> dict[str, Any]:
         try:

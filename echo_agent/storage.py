@@ -11,6 +11,7 @@ from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
 from .models import Fact, FactKind, Intent, Project, ProjectStatus
+from .dispatcher.token_usage import normalize_token_usage
 from .crypto_contract import input_ref, project_crypto
 
 
@@ -134,6 +135,27 @@ class SQLiteProjectStore:
                     metadata TEXT NOT NULL DEFAULT '{}',
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS project_token_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    mode TEXT NOT NULL,
+                    intent_id INTEGER,
+                    model TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'session',
+                    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS project_token_usage_session
+                ON project_token_usage(project_id, session_id)
+                WHERE session_id != '';
                 """
             )
             self._ensure_project_columns(conn)
@@ -556,6 +578,107 @@ class SQLiteProjectStore:
             self.after_clear_logs(project_id)
         return {"project_id": project_id, "deleted": deleted}
 
+    def add_token_usage(self, project_id: int, usage: dict[str, Any]) -> dict[str, Any] | None:
+        self.get_project(project_id)
+        record = normalize_token_usage(usage)
+        if record is None:
+            return None
+        with self._connect() as conn:
+            if record["session_id"]:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM project_token_usage
+                    WHERE project_id = ? AND session_id = ?
+                    """,
+                    (project_id, record["session_id"]),
+                ).fetchone()
+                if existing is not None:
+                    return _token_usage_from_row(self._token_usage_row(conn, project_id, int(existing["id"])))
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO project_token_usage (
+                        project_id, mode, intent_id, model, session_id,
+                        input_tokens, cached_input_tokens, output_tokens,
+                        reasoning_output_tokens, total_tokens, source
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        record["mode"],
+                        record["intent_id"],
+                        record["model"],
+                        record["session_id"],
+                        record["input_tokens"],
+                        record["cached_input_tokens"],
+                        record["output_tokens"],
+                        record["reasoning_output_tokens"],
+                        record["total_tokens"],
+                        record["source"],
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM project_token_usage
+                    WHERE project_id = ? AND session_id = ?
+                    """,
+                    (project_id, record["session_id"]),
+                ).fetchone()
+                if existing is None:
+                    raise
+                return _token_usage_from_row(self._token_usage_row(conn, project_id, int(existing["id"])))
+            return _token_usage_from_row(self._token_usage_row(conn, project_id, int(cursor.lastrowid)))
+
+    def token_usage_summary(self, project_id: int) -> dict[str, Any]:
+        self.get_project(project_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, project_id, created_at, mode, intent_id, model, session_id,
+                       input_tokens, cached_input_tokens, output_tokens,
+                       reasoning_output_tokens, total_tokens, source
+                FROM project_token_usage
+                WHERE project_id = ?
+                ORDER BY id ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        runs = [_token_usage_from_row(row) for row in rows]
+        totals = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+        }
+        by_mode: dict[str, dict[str, int]] = {}
+        for run in runs:
+            for key in totals:
+                totals[key] += int(run[key])
+            bucket = by_mode.setdefault(str(run["mode"]), {"runs": 0, **{key: 0 for key in totals}})
+            bucket["runs"] += 1
+            for key in totals:
+                bucket[key] += int(run[key])
+        return {"project_id": project_id, **totals, "by_mode": by_mode, "runs": runs}
+
+    @staticmethod
+    def _token_usage_row(conn: sqlite3.Connection, project_id: int, row_id: int) -> sqlite3.Row:
+        row = conn.execute(
+            """
+            SELECT id, project_id, created_at, mode, intent_id, model, session_id,
+                   input_tokens, cached_input_tokens, output_tokens,
+                   reasoning_output_tokens, total_tokens, source
+            FROM project_token_usage
+            WHERE project_id = ? AND id = ?
+            """,
+            (project_id, row_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(row_id)
+        return row
+
     def reset_project_progress(self, project_id: int) -> Project:
         """Drop facts, intents, and logs while keeping the project setup.
 
@@ -575,6 +698,8 @@ class SQLiteProjectStore:
                     project.crypto.pop(key, None)
             _sync_boundary_facts(project)
             self.save_project(project)
+            with self._connect() as conn:
+                conn.execute("DELETE FROM project_token_usage WHERE project_id = ?", (project_id,))
             self.clear_project_logs(project_id)
             self.add_project_log(project_id, "已清空进度，下次运行将重新开始")
         return self.get_project(project_id)
@@ -745,4 +870,23 @@ def _log_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "level": str(row["level"]),
         "message": str(row["message"]),
         "metadata": json.loads(str(row["metadata"])),
+    }
+
+
+def _token_usage_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    intent_id = row["intent_id"]
+    return {
+        "id": int(row["id"]),
+        "project_id": int(row["project_id"]),
+        "created_at": row["created_at"],
+        "mode": row["mode"],
+        "intent_id": None if intent_id is None else int(intent_id),
+        "model": row["model"],
+        "session_id": row["session_id"],
+        "input_tokens": int(row["input_tokens"]),
+        "cached_input_tokens": int(row["cached_input_tokens"]),
+        "output_tokens": int(row["output_tokens"]),
+        "reasoning_output_tokens": int(row["reasoning_output_tokens"]),
+        "total_tokens": int(row["total_tokens"]),
+        "source": row["source"],
     }

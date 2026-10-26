@@ -164,6 +164,12 @@ class Dispatcher:
                 stream_idle_timeout_ms=codex_stream_idle_timeout_ms,
             )
         self.agent = agent
+        record_usage = getattr(self.client, "add_token_usage", None)
+        if callable(record_usage):
+            try:
+                agent.on_token_usage = record_usage
+            except (AttributeError, TypeError):
+                pass
         self.worker = worker or CodexWorker(agent, prompt_builder)
         self.reasoner = reasoner or CodexReasoner(agent, prompt_builder)
         self._worker_accepts_mode = callable_accepts_mode(self.worker.execute_intent)
@@ -227,7 +233,7 @@ class Dispatcher:
                 project = self.client.get_project(project_id)
                 result = self._run_project_step(project, release_project=False)
                 results.append(result)
-                if result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED} or self._stop_event.is_set():
+                if result.halt or result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED} or self._stop_event.is_set():
                     break
                 if step_consumes_budget(result):
                     steps += 1
@@ -299,6 +305,7 @@ class Dispatcher:
                 {"intent_id": intent.id},
             )
         result = item.result
+        self._ensure_first_run_failure_fact(project, intent, result, before_facts, release_project)
         self._log(
             project.id,
             "first-run finished",
@@ -316,6 +323,14 @@ class Dispatcher:
         offline = self._target_offline_result(project)
         if offline is not None:
             return offline
+        if self._failed_first_run_waits_for_reason(project, intent, result):
+            return DispatchResult(
+                project.id,
+                DispatchMode.FIRST_RUN,
+                project.status,
+                "initial intent failed; fact saved, reason waits for the next run",
+                halt=True,
+            )
         return DispatchResult(project.id, DispatchMode.FIRST_RUN, project.status, "initial intent executed")
 
     def _explore(
@@ -1964,6 +1979,31 @@ class Dispatcher:
             self._release_project(project)
             self.client.save_project(project)
             self._log(project.id, "project released to stoped", "info")
+
+    def _ensure_first_run_failure_fact(
+        self,
+        project: Project,
+        intent: Intent,
+        result: WorkerResult,
+        before_facts: set[int],
+        release_project: bool,
+    ) -> None:
+        if not self._failed_first_run_waits_for_reason(project, intent, result):
+            return
+        if self._new_fact_ids(project, before_facts):
+            return
+        text = (intent.note or result.detail or "first-run execution failed").strip()
+        fact = project.add_fact(text, kind=FactKind.ERROR)
+        intent.set_targets([fact.id])
+        self._persist_step(project, release_project=release_project)
+
+    @staticmethod
+    def _failed_first_run_waits_for_reason(project: Project, intent: Intent, result: WorkerResult) -> bool:
+        return (
+            project.task_type != "crypto"
+            and not result.retryable
+            and intent.status == IntentStatus.FAILED
+        )
 
     @staticmethod
     def _new_fact_ids(project: Project, before: set[int]) -> list[int]:

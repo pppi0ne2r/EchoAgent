@@ -372,7 +372,7 @@ button.project-delete:disabled {
 
 .summary-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   flex: 0 0 auto;
   border-bottom: 1px solid var(--line);
   background: #fff;
@@ -391,6 +391,13 @@ button.project-delete:disabled {
 .summary-row span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.summary-row em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.35;
 }
 
 .summary-row strong {
@@ -722,6 +729,14 @@ button.project-delete:disabled {
 .run-status-bar.is-running { background: #e7f6f3; color: #0b6b62; }
 .run-status-bar.is-silent { background: #fff6e8; color: #8a5a00; }
 .run-status-bar.is-queued { background: #eef3ff; color: #1d4e89; }
+
+.token-mode-line {
+  flex: 0 0 auto;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
 
 .log-filter {
   display: inline-flex;

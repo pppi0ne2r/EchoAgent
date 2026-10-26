@@ -201,6 +201,10 @@ class WriteupService:
             ),
         )
         agent = self.agent_factory()
+        try:
+            agent.on_token_usage = self.store.add_token_usage
+        except (AttributeError, TypeError):
+            pass
         prompt = self.prompt_builder.build_writeup_prompt(project)
         agent.run(
             project,
