@@ -9,6 +9,8 @@ from echo_agent.dispatcher.agents import CodexDockerAgent
 from echo_agent.dispatcher.types import DispatchMode
 from echo_agent.server.docker_runtime import DockerProjectRuntime
 from echo_agent.system_proxy import (
+    _identity_is_proxy,
+    _loopback_ports_in_proc,
     configured_proxy_environment,
     container_proxy_environment,
     container_proxy_signature,
@@ -108,8 +110,58 @@ class SystemProxyTests(unittest.TestCase):
             patch.dict("sys.modules", {"_scproxy": None}),
             patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
             patch.dict("os.environ", {}, clear=True),
+            patch("echo_agent.system_proxy._local_proxy_settings", return_value={}),
         ):
             self.assertEqual(system_proxy_settings(), {})
+
+    def test_linux_loopback_listener_is_used_when_gnome_mode_is_none(self) -> None:
+        completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")
+        with (
+            patch.dict("sys.modules", {"_scproxy": None}),
+            patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+            patch.dict("os.environ", {}, clear=True),
+            patch("echo_agent.system_proxy._loopback_listen_ports", return_value={7891, 7892}),
+            patch("echo_agent.system_proxy._proxy_process_listen_ports", return_value=set()),
+            patch("echo_agent.system_proxy._looks_like_http_proxy", side_effect=lambda port: port == 7892),
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=True),
+            patch("echo_agent.system_proxy.ensure_container_proxy_reachable") as forward,
+        ):
+            environment = configured_proxy_environment()
+
+        self.assertEqual(environment["https_proxy"], "http://echo-agent-host:7892")
+        self.assertNotIn("all_proxy", environment)
+        forward.assert_called_once()
+
+    def test_linux_loopback_socks_listener_is_used_when_http_probe_fails(self) -> None:
+        completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")
+        with (
+            patch.dict("sys.modules", {"_scproxy": None}),
+            patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+            patch.dict("os.environ", {}, clear=True),
+            patch("echo_agent.system_proxy._loopback_listen_ports", return_value={7891}),
+            patch("echo_agent.system_proxy._proxy_process_listen_ports", return_value={7891}),
+            patch("echo_agent.system_proxy._looks_like_http_proxy", return_value=False),
+            patch("echo_agent.system_proxy._looks_like_socks_proxy", side_effect=lambda port: port == 7891),
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=True),
+            patch("echo_agent.system_proxy.ensure_container_proxy_reachable"),
+        ):
+            environment = configured_proxy_environment()
+
+        self.assertEqual(environment["all_proxy"], "socks5h://echo-agent-host:7891")
+        self.assertNotIn("http_proxy", environment)
+
+    def test_proc_tcp_keeps_only_loopback_listeners(self) -> None:
+        text = "\n".join([
+            "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
+            "0: 0100007F:1ED4 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 12345 1 0000000000000000 100 0 0 10 0",
+            "1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 12346 1 0000000000000000 100 0 0 10 0",
+            "2: 0100007F:1ED5 00000000:0000 01 00000000:00000000 00:00000000 00000000 0 0 12347 1 0000000000000000 100 0 0 10 0",
+        ])
+        self.assertEqual(_loopback_ports_in_proc(text), {7892})
+
+    def test_proxy_process_identity_ignores_unrelated_listeners(self) -> None:
+        self.assertTrue(_identity_is_proxy("mihomo", "/usr/bin/mihomo -d /tmp"))
+        self.assertFalse(_identity_is_proxy("sshd", "/usr/sbin/sshd"))
 
     def test_linux_environment_proxy_is_used_when_gnome_has_none(self) -> None:
         completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")

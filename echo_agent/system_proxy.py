@@ -1,7 +1,8 @@
 """把系统代理转成容器里可用的环境变量。
 
 macOS 从系统代理接口读取。Linux 先读 GNOME 手动代理，没有时再读
-http_proxy、https_proxy 和 all_proxy。容器里的 127.0.0.1 不是宿主机，
+http_proxy、https_proxy 和 all_proxy。这两处都没有时，再识别本机回环上
+已经在监听的 HTTP 或 SOCKS 代理。容器里的 127.0.0.1 不是宿主机，
 所以回环地址要改写到 echo-agent-host。Linux 上只监听回环的代理，
 会在 Docker 网桥地址上补一个转发，容器才能连到宿主机。
 """
@@ -13,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit, urlunsplit
 
@@ -27,13 +29,44 @@ _GNOME_PROXY_KEYS = (
     ("HTTPS", "org.gnome.system.proxy.https"),
     ("SOCKS", "org.gnome.system.proxy.socks"),
 )
+_PROXY_PROCESS_MARKERS = (
+    "clash",
+    "mihomo",
+    "xray",
+    "v2ray",
+    "sing-box",
+    "hysteria",
+    "naiveproxy",
+    "shadowsocks",
+    "ss-local",
+    "trojan",
+    "gost",
+    "privoxy",
+    "tinyproxy",
+    "polipo",
+    "squid",
+    "redsocks",
+    "nekoray",
+    "nekobox",
+    "v2raya",
+    "hiddify",
+)
+_HTTP_PROXY_PORTS = (7890, 7892, 7897, 7893, 10809, 20171, 2080, 8118, 8888, 6152, 1087)
+_SOCKS_PROXY_PORTS = (7891, 1080, 10808, 20170, 6153)
+_LOOPBACK_HEX = {
+    "0100007f",
+    "00000000000000000000000001000000",
+}
 
 
 def system_proxy_settings() -> dict[str, object]:
     native = _native_proxy_settings()
     if _settings_have_proxy(native):
         return native
-    return _environment_proxy_settings()
+    environment = _environment_proxy_settings()
+    if _settings_have_proxy(environment):
+        return environment
+    return _local_proxy_settings()
 
 
 def _native_proxy_settings() -> dict[str, object]:
@@ -135,6 +168,160 @@ def _gsettings_port(raw: str) -> int | None:
     if 1 <= port <= 65535:
         return port
     return None
+
+
+def _local_proxy_settings() -> dict[str, object]:
+    """GNOME 和进程环境都没有代理时，使用本机回环上实际在监听的代理。"""
+    listening = _loopback_listen_ports()
+    if not listening:
+        return {}
+    owned = _proxy_process_listen_ports()
+    for port in _ordered_proxy_ports(owned, listening, _HTTP_PROXY_PORTS):
+        if _looks_like_http_proxy(port):
+            return _endpoint_settings("HTTP", port) | _endpoint_settings("HTTPS", port)
+    for port in _ordered_proxy_ports(owned, listening, _SOCKS_PROXY_PORTS):
+        if _looks_like_socks_proxy(port):
+            return _endpoint_settings("SOCKS", port)
+    return {}
+
+
+def _endpoint_settings(name: str, port: int) -> dict[str, object]:
+    return {
+        f"{name}Enable": 1,
+        f"{name}Proxy": "127.0.0.1",
+        f"{name}Port": port,
+    }
+
+
+def _ordered_proxy_ports(
+    owned: set[int],
+    listening: set[int],
+    preferred: tuple[int, ...],
+) -> list[int]:
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def add(port: int) -> None:
+        if port in seen or port not in listening:
+            return
+        seen.add(port)
+        ordered.append(port)
+
+    for port in preferred:
+        if port in owned:
+            add(port)
+    for port in sorted(owned):
+        add(port)
+    for port in preferred:
+        add(port)
+    return ordered
+
+
+def _loopback_listen_ports() -> set[int]:
+    ports: set[int] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        ports.update(_loopback_ports_in_proc(text))
+    return ports
+
+
+def _loopback_ports_in_proc(text: str) -> set[int]:
+    return set(_loopback_listen_inodes(text).values())
+
+
+def _loopback_listen_inodes(text: str) -> dict[str, int]:
+    found: dict[str, int] = {}
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 10 or fields[3] != "0A":
+            continue
+        address, separator, port_hex = fields[1].partition(":")
+        if separator != ":" or address.lower() not in _LOOPBACK_HEX:
+            continue
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535:
+            found[fields[9]] = port
+    return found
+
+
+def _proxy_process_listen_ports() -> set[int]:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return set()
+    inodes: dict[str, int] = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        inodes.update(_loopback_listen_inodes(text))
+    if not inodes:
+        return set()
+    ports: set[int] = set()
+    for pid_dir in proc.iterdir():
+        if not pid_dir.name.isdigit() or not _process_looks_like_proxy(pid_dir):
+            continue
+        try:
+            descriptors = list((pid_dir / "fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if not target.startswith("socket:[") or not target.endswith("]"):
+                continue
+            port = inodes.get(target[len("socket:["):-1])
+            if port is not None:
+                ports.add(port)
+    return ports
+
+
+def _process_looks_like_proxy(pid_dir: Path) -> bool:
+    try:
+        command = (pid_dir / "comm").read_text(encoding="utf-8", errors="replace")
+        arguments = (pid_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    return _identity_is_proxy(command, arguments)
+
+
+def _identity_is_proxy(command: str, arguments: str) -> bool:
+    identity = f"{command} {arguments}".lower()
+    return any(marker in identity for marker in _PROXY_PROCESS_MARKERS)
+
+
+def _looks_like_http_proxy(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.4) as sock:
+            sock.settimeout(0.4)
+            sock.sendall(
+                b"GET http://127.0.0.1:1/ HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:1\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            data = sock.recv(16)
+    except OSError:
+        return False
+    return data.startswith(b"HTTP/")
+
+
+def _looks_like_socks_proxy(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.4) as sock:
+            sock.settimeout(0.4)
+            sock.sendall(b"\x05\x01\x00")
+            data = sock.recv(2)
+    except OSError:
+        return False
+    return data == b"\x05\x00"
 
 
 def system_proxy_enabled() -> bool:
