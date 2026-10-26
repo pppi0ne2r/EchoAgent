@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import socket
 import subprocess
 import threading
@@ -12,6 +13,8 @@ from echo_agent.dispatcher.agents import CodexDockerAgent
 from echo_agent.dispatcher.types import DispatchMode
 from echo_agent.server.docker_runtime import DockerProjectRuntime
 from echo_agent.system_proxy import (
+    _bind_listener_in_netns,
+    _fib_trie_has_local_address,
     _identity_is_proxy,
     _looks_like_http_proxy,
     _loopback_ports_in_proc,
@@ -254,6 +257,94 @@ class SystemProxyTests(unittest.TestCase):
             ensure_container_proxy_reachable({"https_proxy": "http://echo-agent-host:7890"})
         _forwarded_ports.clear()
         self.assertEqual(binds, [("172.17.0.1", 7890)])
+
+    def test_missing_gateway_address_starts_namespace_forwarder(self) -> None:
+        from echo_agent.system_proxy import _forwarded_ports, _namespace_forwarders, ensure_container_proxy_reachable
+
+        class MissingAddress:
+            def setsockopt(self, *_args: object) -> None:
+                return None
+
+            def bind(self, _address: tuple[str, int]) -> None:
+                raise OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
+
+            def close(self) -> None:
+                return None
+
+        _forwarded_ports.clear()
+        _namespace_forwarders.clear()
+        with (
+            patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
+            patch("echo_agent.system_proxy._tcp_open", side_effect=lambda host, _port: host == "127.0.0.1"),
+            patch("echo_agent.system_proxy.socket.socket", return_value=MissingAddress()),
+            patch("echo_agent.system_proxy._start_namespace_forwarder", return_value=True) as start,
+        ):
+            ensure_container_proxy_reachable({"https_proxy": "http://echo-agent-host:7890"})
+        self.assertEqual(start.call_args.args, ("172.17.0.1", 7890))
+        self.assertIn(7890, _forwarded_ports)
+        _forwarded_ports.clear()
+
+    def test_missing_namespace_is_reported_and_not_marked_started(self) -> None:
+        from echo_agent.system_proxy import _forwarded_ports, _namespace_forwarders, ensure_container_proxy_reachable
+
+        class MissingAddress:
+            def setsockopt(self, *_args: object) -> None:
+                return None
+
+            def bind(self, _address: tuple[str, int]) -> None:
+                raise OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
+
+            def close(self) -> None:
+                return None
+
+        _forwarded_ports.clear()
+        _namespace_forwarders.clear()
+        with (
+            patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
+            patch("echo_agent.system_proxy._tcp_open", side_effect=lambda host, _port: host == "127.0.0.1"),
+            patch("echo_agent.system_proxy.socket.socket", return_value=MissingAddress()),
+            patch("echo_agent.system_proxy._pid_with_local_address", return_value=None),
+            patch("echo_agent.system_proxy._spawn_netns_forwarder") as spawn,
+        ):
+            ensure_container_proxy_reachable({"https_proxy": "http://echo-agent-host:7890"})
+        spawn.assert_not_called()
+        self.assertNotIn(7890, _forwarded_ports)
+
+    def test_fib_trie_requires_local_address(self) -> None:
+        text = "\n".join([
+            "       |-- 172.17.0.1",
+            "          /32 host LOCAL",
+            "       |-- 10.0.0.1",
+            "          /32 link UNICAST",
+        ])
+        self.assertTrue(_fib_trie_has_local_address(text, "172.17.0.1"))
+        self.assertFalse(_fib_trie_has_local_address(text, "10.0.0.1"))
+        self.assertFalse(_fib_trie_has_local_address(text, "172.17.0.10"))
+
+    def test_namespace_bind_restores_original_netns(self) -> None:
+        order: list[tuple[str, object]] = []
+
+        class Listener:
+            def setsockopt(self, *_args: object) -> None:
+                return None
+
+            def bind(self, address: tuple[str, int]) -> None:
+                order.append(("bind", address))
+
+            def listen(self, _backlog: int) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        with (
+            patch("echo_agent.system_proxy.os.open", side_effect=[10, 11]),
+            patch("echo_agent.system_proxy.os.close"),
+            patch("echo_agent.system_proxy._setns", side_effect=lambda fd: order.append(("setns", fd))),
+            patch("echo_agent.system_proxy.socket.socket", return_value=Listener()),
+        ):
+            _bind_listener_in_netns(42, "172.17.0.1", 7892)
+        self.assertEqual(order, [("setns", 11), ("bind", ("172.17.0.1", 7892)), ("setns", 10)])
 
     def test_proxy_signature_ignores_unrelated_container_environment(self) -> None:
         environment = container_proxy_environment(HTTP_SETTINGS)

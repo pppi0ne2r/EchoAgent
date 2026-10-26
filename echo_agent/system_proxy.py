@@ -5,11 +5,16 @@ http_proxy、https_proxy 和 all_proxy。这两处都没有时，再探测本机
 监听进程不可见时也会探测。容器里的 127.0.0.1 不是宿主机，
 所以回环地址要改写到 echo-agent-host。Linux 上只监听回环的代理，
 会在 Docker 网桥地址上补一个转发，容器才能连到宿主机。
+网桥地址不在当前网络命名空间时，改到拥有该地址的命名空间里监听。
 """
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
+import select
+import signal
 import socket
 import subprocess
 import sys
@@ -488,7 +493,9 @@ def proxy_build_arguments(environment: Mapping[str, str]) -> list[str]:
     return ["--add-host", f"{CONTAINER_PROXY_HOST}:host-gateway", *arguments]
 
 
+_CLONE_NEWNET = 0x40000000
 _forwarded_ports: set[int] = set()
+_namespace_forwarders: dict[int, subprocess.Popen[bytes]] = {}
 _forwarder_lock = threading.Lock()
 
 
@@ -509,18 +516,22 @@ def _container_proxy_ports(environment: Mapping[str, str]) -> set[int]:
 
 def _ensure_forwarder(port: int) -> None:
     with _forwarder_lock:
-        if port in _forwarded_ports:
+        if _forwarder_is_running(port):
             return
         gateway = _docker_bridge_gateway()
         if not gateway or _tcp_open(gateway, port) or not _tcp_open("127.0.0.1", port):
             return
         try:
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((gateway, port))
-            listener.listen(32)
-        except OSError:
+            listener = _bound_listener(gateway, port)
+        except OSError as exc:
+            _forwarder_log(
+                f"cannot bind {gateway}:{port} in the current namespace: {exc.strerror or exc}"
+            )
+            if exc.errno != errno.EADDRNOTAVAIL or not _start_namespace_forwarder(gateway, port):
+                return
+            _forwarded_ports.add(port)
             return
+        _namespace_forwarders.pop(port, None)
         _forwarded_ports.add(port)
         threading.Thread(
             target=_accept_proxy_forward,
@@ -528,6 +539,185 @@ def _ensure_forwarder(port: int) -> None:
             daemon=True,
             name=f"echo-agent-proxy-{port}",
         ).start()
+
+
+def _forwarder_is_running(port: int) -> bool:
+    process = _namespace_forwarders.get(port)
+    if process is not None:
+        if process.poll() is None:
+            return True
+        _namespace_forwarders.pop(port, None)
+        _forwarded_ports.discard(port)
+        return False
+    return port in _forwarded_ports
+
+
+def _bound_listener(host: str, port: int) -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, port))
+        listener.listen(32)
+    except OSError:
+        listener.close()
+        raise
+    return listener
+
+
+def _start_namespace_forwarder(gateway: str, port: int) -> bool:
+    """网桥地址属于别的网络命名空间时，在那个命名空间监听，再连回本机回环。"""
+    pid = _pid_with_local_address(gateway)
+    if pid is None:
+        _forwarder_log(f"no network namespace owns {gateway}; proxy forwarder was not started")
+        return False
+    if not _spawn_netns_forwarder(pid, gateway, port):
+        _forwarder_log(f"failed to start proxy forwarder for {gateway}:{port} in netns of pid {pid}")
+        return False
+    _forwarder_log(f"proxy forwarder for {gateway}:{port} is listening in netns of pid {pid}")
+    return True
+
+
+def _spawn_netns_forwarder(pid: int, gateway: str, port: int) -> bool:
+    if not _ipv4_address(gateway) or not 1 <= port <= 65535:
+        return False
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "forward", str(pid), gateway, str(port)],
+        stdout=subprocess.PIPE,
+        stderr=None,
+    )
+    if not _wait_for_forwarder(process):
+        return False
+    _namespace_forwarders[port] = process
+    return True
+
+
+def _wait_for_forwarder(process: subprocess.Popen[bytes]) -> bool:
+    if process.stdout is None:
+        return False
+    readable, _, _ = select.select([process.stdout], [], [], 2)
+    if not readable:
+        _stop_process(process)
+        return False
+    line = process.stdout.readline()
+    if line.startswith(b"ready"):
+        return True
+    _stop_process(process)
+    return False
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        return
+
+
+def _run_netns_forwarder(pid: int, gateway: str, port: int) -> None:
+    _die_with_parent()
+    try:
+        listener = _bind_listener_in_netns(pid, gateway, port)
+    except OSError as exc:
+        _forwarder_log(f"cannot bind {gateway}:{port} in netns of pid {pid}: {exc.strerror or exc}")
+        raise SystemExit(1) from exc
+    sys.stdout.buffer.write(b"ready\n")
+    sys.stdout.buffer.flush()
+    # 监听套接字留在 Docker 的网络命名空间。回到原来的命名空间后，
+    # 新连接的 127.0.0.1 才是宿主机上的代理。
+    _accept_proxy_forward(listener, port)
+
+
+def _bind_listener_in_netns(pid: int, host: str, port: int) -> socket.socket:
+    host_ns = os.open("/proc/self/ns/net", os.O_RDONLY)
+    target_ns = os.open(f"/proc/{pid}/ns/net", os.O_RDONLY)
+    try:
+        _setns(target_ns)
+        try:
+            return _bound_listener(host, port)
+        finally:
+            _setns(host_ns)
+    finally:
+        os.close(host_ns)
+        os.close(target_ns)
+
+
+def _setns(fd: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.setns(fd, _CLONE_NEWNET) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _die_with_parent() -> None:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, signal.SIGTERM)
+    except (AttributeError, OSError):
+        return
+
+
+def _pid_with_local_address(address: str) -> int | None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    own_netns = _netns_inode(os.getpid())
+    seen: set[int] = set()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        inode = _netns_inode(pid)
+        if inode is not None:
+            if inode == own_netns or inode in seen:
+                continue
+            seen.add(inode)
+        try:
+            text = (entry / "net" / "fib_trie").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _fib_trie_has_local_address(text, address):
+            return pid
+    return None
+
+
+def _netns_inode(pid: int) -> int | None:
+    try:
+        return os.stat(f"/proc/{pid}/ns/net").st_ino
+    except OSError:
+        return None
+
+
+def _fib_trie_has_local_address(text: str, address: str) -> bool:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        tokens = line.replace("|", " ").replace("-", " ").split()
+        if address not in tokens:
+            continue
+        window = "\n".join(lines[index:index + 3])
+        if "/32 host LOCAL" in window or "/128 host LOCAL" in window:
+            return True
+    return False
+
+
+def _ipv4_address(value: str) -> bool:
+    try:
+        packed = socket.inet_aton(value)
+    except OSError:
+        return False
+    return socket.inet_ntoa(packed) == value
+
+
+def _forwarder_log(message: str) -> None:
+    print(f"echo-agent proxy: {message}", file=sys.stderr, flush=True)
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) == 5 and argv[1] == "forward":
+        _run_netns_forwarder(int(argv[2]), argv[3], int(argv[4]))
+        return 0
+    return 2
 
 
 def _docker_bridge_gateway() -> str:
@@ -621,3 +811,8 @@ def _for_container(url: str) -> str:
     port = parts.port
     netloc = CONTAINER_PROXY_HOST if port is None else f"{CONTAINER_PROXY_HOST}:{port}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv))
+
