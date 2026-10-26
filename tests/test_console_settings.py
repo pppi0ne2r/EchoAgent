@@ -113,5 +113,37 @@ class ConsoleSettingsTests(unittest.TestCase):
         self.assertTrue(kept["api_key_set"])
         self.assertEqual(overridden.codex_max_slots, 9)
 
+    def test_clash_subscription_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text(MINIMAL_CONFIG, encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                saved = save_console_settings(
+                    max_concurrent_projects=2,
+                    codex_max_slots=2,
+                    explore_max_workers=4,
+                    base_url="https://gateway.example/v1",
+                    model="grok-4.7",
+                    clash_enabled=True,
+                    clash_subscription_url="https://example.com/sub",
+                )
+                loaded = DispatcherSettings.from_env()
+                with self.assertRaises(ValueError):
+                    save_console_settings(
+                        max_concurrent_projects=2,
+                        codex_max_slots=2,
+                        explore_max_workers=4,
+                        base_url="https://gateway.example/v1",
+                        model="grok-4.7",
+                        clash_enabled=True,
+                        clash_subscription_url="",
+                    )
+
+        self.assertTrue(saved["clash_enabled"])
+        self.assertEqual(saved["clash_subscription_url"], "https://example.com/sub")
+        self.assertTrue(loaded.clash_enabled)
+        self.assertEqual(loaded.clash_subscription_url, "https://example.com/sub")
+
+
 if __name__ == "__main__":
     unittest.main()

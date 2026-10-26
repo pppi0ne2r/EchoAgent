@@ -83,3 +83,9 @@ build_network = "host"
 # are configured in the web UI, not as a second resource list.
 root = ".echo_agent/resources"
 items = []
+
+# [clash]
+# Optional mihomo inside each project container. The web console writes the
+# same keys. Leave this commented unless you want a default subscription.
+# enabled = false
+# subscription_url = "https://example.com/clash-subscription"

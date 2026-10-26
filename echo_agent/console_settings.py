@@ -17,6 +17,8 @@ def save_console_settings(
     model: str,
     api_key: str | None = None,
     clear_api_key: bool = False,
+    clash_enabled: bool = False,
+    clash_subscription_url: str = "",
 ) -> dict[str, object]:
     if max_concurrent_projects < 1:
         raise ValueError("max_concurrent_projects must be at least 1")
@@ -30,6 +32,13 @@ def save_console_settings(
     cleaned_model = model.strip()
     if not cleaned_model or any(char in cleaned_model for char in "\n\r"):
         raise ValueError("model cannot be empty")
+    subscription = clash_subscription_url.strip()
+    if subscription and (
+        not subscription.startswith(("http://", "https://")) or any(char.isspace() for char in subscription)
+    ):
+        raise ValueError("Clash 订阅地址必须以 http:// 或 https:// 开头，且不能包含空白")
+    if clash_enabled and not subscription:
+        raise ValueError("启用 Clash 时需要填写 http 或 https 订阅地址")
     if clear_api_key:
         stored_key = ""
     elif api_key and api_key.strip():
@@ -56,6 +65,10 @@ def save_console_settings(
                 f"reason_model = {_toml_string(cleaned_model)}",
                 f"base_url = {_toml_string(cleaned_url)}",
                 f"api_key = {_toml_string(stored_key)}",
+                "",
+                "[clash]",
+                f"enabled = {'true' if clash_enabled else 'false'}",
+                f"subscription_url = {_toml_string(subscription)}",
                 "",
             ]
         ),
@@ -86,6 +99,8 @@ def _public_settings(settings: DispatcherSettings) -> dict[str, object]:
         "models_unified": len(models) <= 1,
         "api_key_set": bool(key),
         "api_key_hint": key[-4:] if len(key) > 4 else "",
+        "clash_enabled": settings.clash_enabled,
+        "clash_subscription_url": settings.clash_subscription_url,
     }
 
 

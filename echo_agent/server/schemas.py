@@ -94,6 +94,8 @@ class ConsoleSettingsUpdate(BaseModel):
     model: str
     api_key: str | None = None
     clear_api_key: bool = False
+    clash_enabled: bool = False
+    clash_subscription_url: str = ""
 
 
 class ExtensionCreateRequest(BaseModel):

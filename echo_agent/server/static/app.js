@@ -2433,6 +2433,8 @@ async function loadSettings() {
   form.model.value = settings.model || "";
   form.api_key.value = "";
   form.clear_api_key.checked = false;
+  form.clash_enabled.checked = Boolean(settings.clash_enabled);
+  form.clash_subscription_url.value = settings.clash_subscription_url || "";
   if (els.apiKeyHint) {
     els.apiKeyHint.textContent = settings.api_key_set
       ? `当前已保存 API Key${settings.api_key_hint ? `，末尾 ${settings.api_key_hint}` : ""}。留空则保持不变。`
@@ -2463,6 +2465,8 @@ els.settingsForm?.addEventListener("submit", async (event) => {
         model: data.get("model"),
         api_key: data.get("api_key") || null,
         clear_api_key: data.get("clear_api_key") === "on",
+        clash_enabled: data.get("clash_enabled") === "on",
+        clash_subscription_url: data.get("clash_subscription_url") || "",
       }),
     });
     await loadSettings();

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EchoAgent Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=36" />
+    <link rel="stylesheet" href="/static/styles.css?v=37" />
   </head>
   <body>
     <header class="topbar">
@@ -243,7 +243,7 @@
         <header class="settings-header">
           <div>
             <h2>配置</h2>
-            <p>并发和 Codex。保存后只影响之后启动的项目。</p>
+            <p>并发、Codex 和 Clash。保存后只影响之后启动的项目。</p>
           </div>
           <div class="settings-actions">
             <p id="settings-status" class="settings-status" hidden></p>
@@ -290,10 +290,25 @@
               清除已保存的 API Key
             </label>
           </section>
+          <section class="settings-card settings-card-wide">
+            <header>
+              <h2>Clash</h2>
+              <p>在项目容器里启动 mihomo。开启后，遵守代理环境变量的程序会走 127.0.0.1:7890。正在运行的容器不会被重启。</p>
+            </header>
+            <label class="check-label hint-toggle">
+              <input name="clash_enabled" type="checkbox" />
+              启用 Clash
+            </label>
+            <label>
+              订阅地址
+              <input name="clash_subscription_url" type="url" placeholder="https://example.com/clash-subscription" />
+            </label>
+            <p class="settings-note">容器启动时直接下载订阅，并只监听 127.0.0.1:7890。容器需要能访问这个地址。下载或启动失败时看容器内 /tmp/mihomo.log。不开启时不改容器网络。</p>
+          </section>
         </div>
       </form>
     </section>
 
-    <script src="/static/app.js?v=46"></script>
+    <script src="/static/app.js?v=47"></script>
   </body>
 </html>

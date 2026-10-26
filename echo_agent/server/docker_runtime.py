@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from echo_agent.clash import clash_docker_arguments, clash_environment_changed
 from echo_agent.config import DispatcherSettings, ProjectResource
 from echo_agent.config import ServerSettings
 from echo_agent.crypto_files import CryptoProjectFiles
@@ -109,7 +110,7 @@ class DockerProjectRuntime:
         self._log(log, "docker container inspect started", docker=container)
         state = self._container_state(container)
         self._log(log, "docker container inspect finished", docker=container, state=state or "missing")
-        if state is None:
+        if state is None or self._recreate_stopped_container_for_clash(project, container, state, log):
             self._log(log, "docker container create/start started", docker=container, image=self.image)
             self._run(
                 self._docker_run_command(container, mounts, crypto=project.task_type == "crypto"),
@@ -241,6 +242,7 @@ class DockerProjectRuntime:
         for host_path, container_path, read_only in mounts:
             mode = "ro" if read_only else "rw"
             command.extend(["-v", f"{host_path}:{container_path}:{mode}"])
+        command.extend(clash_docker_arguments())
         command.extend([self.image, *self.keepalive_command])
         return command
 
@@ -249,6 +251,9 @@ class DockerProjectRuntime:
         state = self._container_state(container)
         if state is None:
             self._log(log, "docker container missing before run; creating it", docker=container)
+            self.ensure_project_container(project, log=log)
+            return
+        if self._recreate_stopped_container_for_clash(project, container, state, log):
             self.ensure_project_container(project, log=log)
             return
         if state != "running":
@@ -284,6 +289,42 @@ class DockerProjectRuntime:
             self._log(log, "docker container remove finished", docker=container)
             return
         self._log(log, "docker container already removed", docker=container)
+
+    def _recreate_stopped_container_for_clash(
+        self,
+        project: Project,
+        container: str,
+        state: str | None,
+        log: DockerLogCallback | None,
+    ) -> bool:
+        if state in {None, "running"} or not self._clash_environment_changed(container):
+            return False
+        self._log(log, "docker container recreate started for clash settings", docker=container)
+        self.remove_project_container(project, log=log)
+        return True
+
+    def _clash_environment_changed(self, container: str) -> bool:
+        env = self._container_env(container)
+        if env is None:
+            return False
+        return clash_environment_changed(env)
+
+    def _container_env(self, container: str) -> list[str] | None:
+        completed = subprocess.run(
+            ["docker", "inspect", "-f", "{{json .Config.Env}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        try:
+            parsed = json.loads(completed.stdout.strip() or "null")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            return None
+        return parsed
 
     def _container_state(self, container: str) -> str | None:
         completed = subprocess.run(

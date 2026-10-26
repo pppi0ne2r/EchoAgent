@@ -75,6 +75,8 @@ class DispatcherSettings:
     project_docker_context: Path
     project_dockerfile: Path
     project_docker_build_network: str | None
+    clash_enabled: bool = False
+    clash_subscription_url: str = ""
     project_resource_root: Path
     project_resources: tuple[ProjectResource, ...] = ()
     codex_command: tuple[str, ...]
@@ -246,6 +248,15 @@ class DispatcherSettings:
                 "ECHO_AGENT_PROJECT_DOCKER_BUILD_NETWORK",
                 _config_value(config, "docker", "build_network"),
             ),
+            clash_enabled=_optional_bool(
+                "ECHO_AGENT_CLASH_ENABLED",
+                _config_value(config, "clash", "enabled", default=False),
+            ),
+            clash_subscription_url=_optional_setting(
+                "ECHO_AGENT_CLASH_SUBSCRIPTION_URL",
+                _config_value(config, "clash", "subscription_url", default=""),
+            )
+            or "",
             project_resource_root=_path_setting(
                 config,
                 _setting(
@@ -420,6 +431,23 @@ def _path_setting(config: dict[str, Any], value: Any) -> Path:
     if isinstance(config_dir, Path):
         return config_dir / path
     return path
+
+
+def _optional_bool(env_name: str, config_value: Any) -> bool:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        raw = config_value
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return False
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    raise ValueError("EchoAgent config clash.enabled must be a boolean")
 
 
 def _bool_config_value(

@@ -871,6 +871,8 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 model=data.model,
                 api_key=data.api_key,
                 clear_api_key=data.clear_api_key,
+                clash_enabled=data.clash_enabled,
+                clash_subscription_url=data.clash_subscription_url,
             )
             app.state.dispatcher_runner._promote()
             return saved

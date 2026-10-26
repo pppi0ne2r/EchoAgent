@@ -320,5 +320,56 @@ class ContainerRestartTests(unittest.TestCase):
         self.assertEqual(stopped._container_state("echo-agent-task-8"), "exited")
 
 
+class ClashContainerTests(unittest.TestCase):
+    def _runtime(self, state: str | None) -> StatefulDockerProjectRuntime:
+        runtime = StatefulDockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+            image_exists=True,
+            container_state=state,
+        )
+
+        def container_env(container: str) -> list[str]:
+            return ["PATH=/usr/bin"]
+
+        object.__setattr__(runtime, "_container_env", container_env)
+        return runtime
+
+    def test_stopped_container_is_recreated_when_clash_settings_change(self) -> None:
+        runtime = self._runtime("exited")
+        project = Project(id=7, name="task-7", docker="echo-agent-task-7")
+        desired = {
+            "ECHO_CLASH_ENABLED": "1",
+            "ECHO_CLASH_SUBSCRIPTION_URL": "https://example.com/sub",
+            "http_proxy": "http://127.0.0.1:7890",
+            "HTTP_PROXY": "http://127.0.0.1:7890",
+            "https_proxy": "http://127.0.0.1:7890",
+            "HTTPS_PROXY": "http://127.0.0.1:7890",
+            "all_proxy": "socks5h://127.0.0.1:7890",
+            "ALL_PROXY": "socks5h://127.0.0.1:7890",
+            "no_proxy": "localhost,127.0.0.1,::1",
+            "NO_PROXY": "localhost,127.0.0.1,::1",
+        }
+        with patch("echo_agent.clash.desired_clash_environment", return_value=desired):
+            runtime.start_project_container(project)
+        self.assertEqual(runtime.commands[0][:3], ["docker", "rm", "-f"])
+        run = runtime.commands[1]
+        self.assertEqual(run[:4], ["docker", "run", "-d", "--name"])
+        self.assertIn("ECHO_CLASH_ENABLED=1", run)
+        self.assertIn("http_proxy=http://127.0.0.1:7890", run)
+        self.assertEqual(len(runtime.commands), 2)
+
+    def test_running_container_is_not_recreated_for_clash_settings(self) -> None:
+        runtime = self._runtime("running")
+        project = Project(id=7, name="task-7", docker="echo-agent-task-7")
+        with patch(
+            "echo_agent.clash.desired_clash_environment",
+            return_value={"ECHO_CLASH_ENABLED": "1", "ECHO_CLASH_SUBSCRIPTION_URL": "https://example.com/sub"},
+        ):
+            runtime.start_project_container(project)
+        self.assertEqual(runtime.commands, [])
+
+
 if __name__ == "__main__":
     unittest.main()

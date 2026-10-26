@@ -90,11 +90,24 @@ WORKDIR /home/kali/workspace
 
 COPY ./entrypoint.sh /opt/echo-agent/entrypoint.sh
 COPY ./codex-config.toml /opt/echo-agent/codex-config.toml
+COPY ./clash_config.py /opt/echo-agent/clash_config.py
 USER root
 RUN chmod 755 /opt/echo-agent/entrypoint.sh && \
     mkdir -p /home/kali/.codex /home/kali/ghidra-projects && \
     cp /opt/echo-agent/codex-config.toml /home/kali/.codex/config.toml && \
     chown -R kali:kali /home/kali/.codex /home/kali/ghidra-projects /opt/echo-agent
+ARG MIHOMO_VERSION=v1.19.33
+RUN arch="$(dpkg --print-architecture)" && \
+    case "$arch" in \
+      amd64) mihomo_arch="amd64" ;; \
+      arm64) mihomo_arch="arm64" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac && \
+    wget ${WGET_RETRY_FLAGS} -O /tmp/mihomo.gz \
+      "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-${mihomo_arch}-${MIHOMO_VERSION}.gz" && \
+    gzip -dc /tmp/mihomo.gz > /usr/local/bin/mihomo && \
+    chmod 755 /usr/local/bin/mihomo && \
+    rm -f /tmp/mihomo.gz
 USER kali
 
 ENTRYPOINT ["/opt/echo-agent/entrypoint.sh"]
