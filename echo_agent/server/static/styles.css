@@ -370,46 +370,78 @@ button.project-delete:disabled {
 .badge.goal,
 .badge.inactive { background: var(--muted); }
 
-.summary-row {
+.project-meta {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
   flex: 0 0 auto;
+  gap: 16px;
+  padding: 16px 18px 14px;
   border-bottom: 1px solid var(--line);
   background: #fff;
 }
 
-.summary-row div {
-  display: grid;
-  gap: 4px;
+.meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 20px 40px;
   min-width: 0;
-  padding: 10px 12px;
-  border-right: 1px solid var(--line);
 }
 
-.summary-row div:last-child { border-right: 0; }
+.meta-field {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 140px;
+  padding: 0;
+  border: 0;
+}
 
-.summary-row span {
+.meta-field:first-child {
+  min-width: 0;
+}
+
+.meta-field > span,
+.meta-target > span,
+.meta-breakdown {
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.4;
 }
 
-.summary-row em {
-  color: var(--muted);
-  font-size: 12px;
-  font-style: normal;
-  line-height: 1.35;
+.meta-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 
-.summary-row strong {
-  display: -webkit-box;
-  overflow: hidden;
+.meta-field strong,
+.meta-target strong {
+  color: var(--text);
   font-size: 13px;
   font-weight: 680;
-  line-height: 1.35;
-  white-space: normal;
-  overflow-wrap: break-word;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  line-height: 1.45;
+}
+
+.meta-breakdown {
+  margin: 0;
+}
+
+.meta-breakdown:empty { display: none; }
+
+.meta-target {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px 16px;
+  min-width: 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.meta-target strong {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .graph-shell {
@@ -425,7 +457,7 @@ button.project-delete:disabled {
 
 .graph-viewport {
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 160px;
   overflow: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--line);
@@ -611,8 +643,9 @@ button.project-delete:disabled {
 }
 
 .graph-detail {
-  flex: 0 1 auto;
-  max-height: 34%;
+  flex: 0 0 auto;
+  min-height: 168px;
+  max-height: max(168px, min(42%, 300px));
   overflow: auto;
   overscroll-behavior: contain;
   padding: 12px;

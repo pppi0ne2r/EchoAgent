@@ -41,7 +41,11 @@ const els = {
   deleteProject: document.querySelector("#delete-project"),
   title: document.querySelector("#project-title"),
   subtitle: document.querySelector("#project-subtitle"),
-  summary: document.querySelector("#summary-row"),
+  projectStatus: document.querySelector("#project-status"),
+  projectQueue: document.querySelector("#project-queue"),
+  projectCounts: document.querySelector("#project-counts"),
+  projectTarget: document.querySelector("#project-target"),
+  tokenTotal: document.querySelector("#token-total"),
   graphViewport: document.querySelector("#graph-viewport"),
   graph: document.querySelector("#project-graph"),
   graphDetail: document.querySelector("#graph-detail"),
@@ -248,16 +252,7 @@ function renderCurrentProject() {
   }
   els.title.textContent = project.name;
   els.subtitle.textContent = `#${project.id} · ${project.objective || "未填写目的"}`;
-  const values = [
-    project.status,
-    targetSummary(state.currentProject || project),
-    `${project.facts.length} facts · ${project.intents.length} intents`,
-    state.runStatus?.queued ? "queued" : state.runStatus?.running ? "running" : "idle",
-  ];
-  [...els.summary.querySelectorAll("strong")].forEach((node, index) => {
-    if (index < values.length) node.textContent = values[index];
-  });
-  renderTokenSummary();
+  renderProjectMeta();
   updateActionButtons();
   drawGraph(project);
   renderGraphDetail(project);
@@ -454,8 +449,8 @@ function isScheduleLog(log) {
   const message = logMessage(log);
   if (/^project entered (explore|reason|first_run) mode$/.test(message)) return true;
   if (message === "first-run initial intent started") return true;
-  if (/^explore started with \d+ active intents$/.test(message)) return true;
-  if (/^explore intent \d+ (finished|released for retry)$/.test(message)) return true;
+  if (/^explore started with \d+ active intents\b/.test(message)) return true;
+  if (/^explore intent \d+ (started|finished|released for retry)$/.test(message)) return true;
   if (message === "first-run finished") return true;
   if (isWriteupLog(message)) return true;
   return Boolean(finalResultText(message, log.metadata || {}));
@@ -482,7 +477,7 @@ function phaseSummary(log) {
   if (entered) return `进入${modeLabel(entered[1]) || entered[1]}`;
   if (message === "first-run initial intent started") return startedIntentText(metadata);
   if (message === "first-run finished") return intentNodeText(metadata.intent_id ?? "?", metadata, Boolean(metadata.retryable));
-  const exploreStart = message.match(/^explore started with (\d+) active intents$/);
+  const exploreStart = message.match(/^explore started with (\d+) active intents\b/);
   if (exploreStart) return startedIntentText(metadata, exploreStart[1]);
   const exploreIntent = message.match(/^explore intent (\d+) (finished|released for retry)$/);
   if (exploreIntent) return intentNodeText(exploreIntent[1], metadata, exploreIntent[2] !== "finished");
@@ -598,7 +593,7 @@ function renderRunStatus() {
   if (run?.running) {
     const parts = ["运行中"];
     const mode = currentMode();
-    const intent = currentIntent();
+    const intent = runningIntentLabels();
     if (mode) parts.push(mode);
     if (intent) parts.push(`intent ${intent}`);
     const startedAt = runAnchorTime();
@@ -691,6 +686,35 @@ function intentNumberList(metadata, key) {
   return metadataIdList(metadata, key);
 }
 
+function projectIntent(id) {
+  return (state.currentProject?.intents || []).find((item) => Number(item.id) === Number(id)) || null;
+}
+
+function runningIntentLabels() {
+  return (state.currentProject?.intents || [])
+    .filter((item) => item.status === "running")
+    .map((item) => `#${item.id}`)
+    .join("、");
+}
+
+function exploreIntentActivity(phase, intent) {
+  if (intent.finished || phase.status !== "running") return "done";
+  const live = projectIntent(intent.id)?.status;
+  if (live === "running") return "running";
+  if (live === "active") return "waiting";
+  if (intent.started) return "running";
+  if (phase.trackedStarts) return "waiting";
+  return "running";
+}
+
+function intentPlanText(id, summaries) {
+  const summary = (summaries || []).find((item) => Number(item.id) === Number(id));
+  const raw = summary?.description || projectIntent(id)?.description || "";
+  const text = String(raw).replace(/\s+/g, " ").trim();
+  const brief = text.length > 72 ? `${text.slice(0, 72)}…` : text;
+  return brief ? `#${id} ${brief}` : `#${id}`;
+}
+
 const ANSWER_WRAPPER_PREFIX = "agent reported possible final answer:";
 const PARTIAL_OUTPUT_PREFIX = "未完成执行的输出摘录：";
 
@@ -729,9 +753,11 @@ function factSupportsAnswer(fact, answer) {
 }
 
 function intentTargets(intent) {
-  const raw = Array.isArray(intent?.tos) && intent.tos.length ? intent.tos : [intent?.to];
+  const listed = Array.isArray(intent?.tos) ? intent.tos : [];
+  const raw = listed.length ? listed : (intent?.to == null || intent?.to === "" ? [] : [intent.to]);
   const targets = [];
   for (const value of raw) {
+    if (value == null || value === "") continue;
     const id = Number(value);
     if (!Number.isInteger(id) || id < 0 || targets.includes(id)) continue;
     targets.push(id);
@@ -828,9 +854,52 @@ function sumTokenRuns(runs) {
   return runs.reduce((sum, run) => sum + (Number(run.total_tokens) || 0), 0);
 }
 
+function detailStatusLabel(status) {
+  return {
+    inactive: "未激活",
+    active: "待运行",
+    running: "运行中",
+    stoped: "已停止",
+    completed: "已完成",
+  }[status] || status || "-";
+}
+
+function renderProjectMeta() {
+  const project = state.currentProject;
+  if (!project || !state.currentProjectId) {
+    if (els.projectStatus) {
+      els.projectStatus.textContent = "-";
+      els.projectStatus.className = "badge empty";
+    }
+    if (els.projectQueue) els.projectQueue.hidden = true;
+    if (els.projectCounts) els.projectCounts.textContent = "-";
+    if (els.projectTarget) {
+      els.projectTarget.textContent = "-";
+      els.projectTarget.removeAttribute("title");
+    }
+    renderTokenSummary();
+    return;
+  }
+  if (els.projectStatus) {
+    els.projectStatus.textContent = detailStatusLabel(project.status);
+    els.projectStatus.className = `badge ${project.status || "empty"}`;
+  }
+  if (els.projectQueue) els.projectQueue.hidden = !state.runStatus?.queued;
+  if (els.projectCounts) {
+    els.projectCounts.textContent = `${project.facts.length} facts · ${project.intents.length} intents`;
+  }
+  if (els.projectTarget) {
+    const target = targetSummary(project);
+    els.projectTarget.textContent = target;
+    const raw = String(project.target_url || "").trim();
+    if (raw) els.projectTarget.title = raw;
+    else els.projectTarget.removeAttribute("title");
+  }
+  renderTokenSummary();
+}
+
 function renderTokenSummary() {
-  const nodes = [...els.summary.querySelectorAll("strong")];
-  const tokenNode = nodes[4];
+  const tokenNode = els.tokenTotal;
   const usage = state.tokenUsage;
   if (!tokenNode) return;
   if (!state.currentProjectId) {
@@ -929,8 +998,16 @@ function scheduleRows(phase) {
         id: `${phase.id}-plan`,
         role: "child",
         level: "info",
-        text: `得到 intent ${phase.plannedIntents.map((id) => `#${id}`).join("、")}`,
+        text: `得到 ${phase.plannedIntents.length} 个 intent`,
       });
+      for (const id of phase.plannedIntents) {
+        rows.push({
+          id: `${phase.id}-plan-${id}`,
+          role: "child",
+          level: "info",
+          text: intentPlanText(id, phase.plannedSummaries),
+        });
+      }
     } else if (phase.done && phase.plannedCount) {
       rows.push({
         id: `${phase.id}-plan`,
@@ -947,12 +1024,44 @@ function scheduleRows(phase) {
       });
     }
   } else {
+    if (phase.kind === "explore" && phase.status === "running") {
+      const running = [];
+      const waiting = [];
+      for (const intent of phase.intentRows) {
+        if (intent.finished) continue;
+        const activity = exploreIntentActivity(phase, intent);
+        if (activity === "waiting") waiting.push(intent.id);
+        else running.push(intent.id);
+      }
+      rows.push({
+        id: `${phase.id}-running`,
+        role: "child",
+        level: "info",
+        text: running.length
+          ? `正在执行 intent ${running.map((id) => `#${id}`).join("、")}`
+          : "当前没有正在执行的 intent",
+      });
+      if (waiting.length) {
+        rows.push({
+          id: `${phase.id}-waiting`,
+          role: "child",
+          level: "info",
+          text: `等待执行 intent ${waiting.map((id) => `#${id}`).join("、")}`,
+        });
+      }
+    }
     for (const intent of phase.intentRows) {
+      const activity = phase.kind === "explore" ? exploreIntentActivity(phase, intent) : "done";
+      const text = activity === "waiting"
+        ? `intent #${intent.id} 等待执行`
+        : activity === "running"
+          ? intentTokenText(`intent #${intent.id} 进行中`, phase, intent.id)
+          : intentTokenText(intentResultText(intent, phase.status !== "running" || intent.finished), phase, intent.id);
       rows.push({
         id: `${phase.id}-intent-${intent.id}`,
         role: "child",
         level: intent.retry ? "warning" : intent.failed ? "error" : "info",
-        text: intentTokenText(intentResultText(intent, phase.status !== "running"), phase, intent.id),
+        text,
       });
     }
   }
@@ -980,6 +1089,8 @@ function scheduleNarrative(logs) {
       status: "running",
       intentRows: [],
       plannedIntents: [],
+      plannedSummaries: [],
+      trackedStarts: false,
       plannedCount: 0,
       done: false,
       result: "",
@@ -1001,7 +1112,7 @@ function scheduleNarrative(logs) {
     const numericId = Number(id);
     let row = current.intentRows.find((item) => item.id === numericId);
     if (!row) {
-      row = { id: numericId, facts: [], retry: false, failed: false, finished: false, legacyFacts: false };
+      row = { id: numericId, facts: [], retry: false, failed: false, finished: false, legacyFacts: false, started: false };
       current.intentRows.push(row);
     }
     return row;
@@ -1051,7 +1162,7 @@ function scheduleNarrative(logs) {
       if (current?.kind !== "reason") start("reason", log);
       continue;
     }
-    const planned = message.match(/^reason planned (\d+) new intents$/);
+    const planned = message.match(/^reason planned (\d+) new intents\b/);
     if (planned) {
       if (current?.kind !== "reason") start("reason", log);
       touch(log);
@@ -1060,6 +1171,7 @@ function scheduleNarrative(logs) {
       current.status = "done";
       current.plannedCount = Number(planned[1]);
       current.plannedIntents = intentNumberList(metadata, "intent_ids");
+      current.plannedSummaries = Array.isArray(metadata.intent_summaries) ? metadata.intent_summaries : [];
       continue;
     }
     if (message === "reason marked project completed") {
@@ -1083,7 +1195,7 @@ function scheduleNarrative(logs) {
       markStopped(finalResultText(message, metadata), log);
       continue;
     }
-    if (message === "first-run initial intent started" || /^explore started with \d+ active intents$/.test(message)) {
+    if (message === "first-run initial intent started" || /^explore started with \d+ active intents\b/.test(message)) {
       const kind = message === "first-run initial intent started" ? "first" : "explore";
       if (current?.kind !== kind) start(kind, log);
       touch(log);
@@ -1105,6 +1217,15 @@ function scheduleNarrative(logs) {
         row.failed = true;
         row.finished = true;
       }
+      continue;
+    }
+    const exploreStartIntent = message.match(/^explore intent (\d+) started$/);
+    if (exploreStartIntent) {
+      if (current?.kind !== "explore") start("explore", log);
+      touch(log);
+      current.trackedStarts = true;
+      const row = ensureIntent(Number(exploreStartIntent[1]));
+      row.started = true;
       continue;
     }
     const exploreIntent = message.match(/^explore intent (\d+) (finished|released for retry)$/);
@@ -1271,6 +1392,7 @@ function drawGraph(project) {
   svg.appendChild(viewport);
   const edges = graphEdges(intents);
   const edgePorts = assignEdgePorts(edges, factPositions, intentPositions);
+  const edgeRoutes = assignEdgeRoutes(edges, factPositions, intentPositions);
   const edgeLanes = assignEdgeLanes(edges, factPositions, intentPositions);
   const edgeLayer = svgElement("g", { class: "graph-edge-layer" });
   const nodeLayer = svgElement("g", { class: "graph-node-layer" });
@@ -1292,14 +1414,20 @@ function drawGraph(project) {
       drawGraph(project);
       renderGraphDetail(project);
     };
+    const route = edgeRoutes.get(graphEdge.key);
     const edge = routeEdge(start, end, {
       port: edgePorts.get(graphEdge.key) || 0,
       laneY: edgeLanes.get(graphEdge.key),
+      trunkX: route?.x,
+      trackY: route?.trackY,
+      showLabel: route ? route.label : true,
       sourceHalf: from ? 92 : 82,
       targetHalf: to ? 92 : 82,
     });
     edgeLayer.appendChild(line(edge.path, statusColor(intent.status), selected, onClick, intent));
-    edgeLayer.appendChild(label(edge.labelX, edge.labelY, `#${intent.id}`, selected, onClick, intent));
+    if (edge.showLabel !== false) {
+      edgeLayer.appendChild(label(edge.labelX, edge.labelY, `#${intent.id}`, selected, onClick, intent));
+    }
   }
 
   for (const fact of facts) {
@@ -1339,10 +1467,14 @@ function clampZoom(value) {
 function computeFitZoom() {
   const viewport = els.graphViewport;
   if (!viewport || !state.graphBaseWidth || !state.graphBaseHeight) return null;
-  const availableWidth = viewport.clientWidth - 12;
-  const availableHeight = viewport.clientHeight - 12;
+  const availableWidth = viewport.clientWidth - 24;
+  const availableHeight = viewport.clientHeight - 24;
   if (availableWidth < 80 || availableHeight < 80) return null;
-  return clampZoom(Math.min(1, availableWidth / state.graphBaseWidth, availableHeight / state.graphBaseHeight));
+  const widthZoom = availableWidth / state.graphBaseWidth;
+  const heightZoom = availableHeight / state.graphBaseHeight;
+  if (widthZoom >= 1 && heightZoom >= 1) return 1;
+  if (heightZoom < 1 && widthZoom >= 0.85) return 1;
+  return clampZoom(Math.min(1, Math.max(widthZoom, 0.85)));
 }
 
 function applyGraphZoom() {
@@ -1433,13 +1565,13 @@ function bindGraphInteractions() {
 }
 
 const GRAPH = {
-  marginX: 150,
-  marginY: 168,
-  factColumnGap: 440,
-  intentColumnGap: 260,
-  rowGap: 140,
-  minWidth: 1040,
-  minHeight: 560,
+  marginX: 108,
+  marginY: 72,
+  factColumnGap: 380,
+  intentColumnGap: 220,
+  rowGap: 112,
+  minWidth: 640,
+  minHeight: 420,
 };
 
 function layoutGraph(facts, intents) {
@@ -1454,8 +1586,8 @@ function layoutGraph(facts, intents) {
   const points = [...factPositions.values(), ...intentPositions.values()];
   const maxX = points.reduce((max, point) => Math.max(max, point.x), GRAPH.marginX);
   const maxY = points.reduce((max, point) => Math.max(max, point.y), GRAPH.marginY);
-  const width = Math.max(GRAPH.minWidth, maxX + GRAPH.marginX + 30);
-  const height = Math.max(GRAPH.minHeight, maxY + 150);
+  const width = Math.max(GRAPH.minWidth, maxX + GRAPH.marginX + 24);
+  const height = Math.max(GRAPH.minHeight, maxY + GRAPH.marginY);
   return { width, height, factPositions, intentPositions };
 }
 
@@ -1473,19 +1605,30 @@ function groupOpenIntents(intents) {
 function layoutOpenIntents(intents, factPositions, factDepthById, factColumnCount) {
   const grouped = groupOpenIntents(intents);
   const positions = new Map();
-  for (const [key, group] of grouped.entries()) {
+  const groups = [...grouped.entries()].flatMap(([key, group]) => {
     group.sort((left, right) => left.id - right.id);
     const source = key === "__initial__" ? { x: GRAPH.marginX, y: GRAPH.marginY } : factPositions.get(Number(key));
-    if (!source) continue;
+    return source ? [{ key, group, source }] : [];
+  });
+  groups.sort((left, right) => right.source.y - left.source.y || left.group[0].id - right.group[0].id);
+  for (const { key, group, source } of groups) {
     const sourceDepth = key === "__initial__" ? 0 : (factDepthById.get(Number(key)) ?? 0);
     const isLastFactColumn = sourceDepth >= factColumnCount - 1;
-    const x = isLastFactColumn
-      ? source.x + GRAPH.intentColumnGap
-      : source.x + Math.round(GRAPH.factColumnGap * 0.5);
-    const rowGap = 78;
-    const startY = source.y + 96;
+    if (isLastFactColumn) {
+      group.forEach((intent, index) => {
+        positions.set(intent.id, { x: source.x + GRAPH.intentColumnGap, y: source.y + index * GRAPH.rowGap });
+      });
+      continue;
+    }
+    const shift = group.length * GRAPH.rowGap;
+    for (const point of factPositions.values()) {
+      if (Math.abs(point.x - source.x) < 1 && point.y > source.y) point.y += shift;
+    }
+    for (const point of positions.values()) {
+      if (Math.abs(point.x - source.x) < 1 && point.y > source.y) point.y += shift;
+    }
     group.forEach((intent, index) => {
-      positions.set(intent.id, { x, y: startY + index * rowGap });
+      positions.set(intent.id, { x: source.x, y: source.y + (index + 1) * GRAPH.rowGap });
     });
   }
   return positions;
@@ -1499,31 +1642,15 @@ function layoutFactsLeftToRight(columns, intents) {
       positions.set(fact.id, { x, y: GRAPH.marginY + rowIndex * GRAPH.rowGap });
     });
   });
-  const links = linkedFactIds(intents);
-  for (let iteration = 0; iteration < 6; iteration += 1) {
-    for (const columnFacts of columns) {
-      const desired = columnFacts.map((fact) => medianY(links.get(fact.id) || [], positions) ?? positions.get(fact.id).y);
-      let cursor = GRAPH.marginY;
-      columnFacts.forEach((fact, index) => {
-        const y = Math.max(cursor, desired[index]);
-        positions.get(fact.id).y = y;
-        cursor = y + GRAPH.rowGap;
-      });
-    }
-  }
-  const minY = Math.min(...Array.from(positions.values(), (point) => point.y));
-  const shift = GRAPH.marginY - minY;
-  if (shift) {
-    for (const point of positions.values()) point.y += shift;
-  }
+  alignColumnsToNeighbors(columns, positions, intents);
   return positions;
 }
 
-function linkedFactIds(intents) {
-  const links = new Map();
-  const add = (left, right) => {
-    if (!links.has(left)) links.set(left, []);
-    links.get(left).push(right);
+function alignColumnsToNeighbors(columns, positions, intents) {
+  const neighbors = new Map();
+  const add = (factId, otherId) => {
+    if (!neighbors.has(factId)) neighbors.set(factId, []);
+    neighbors.get(factId).push(otherId);
   };
   for (const intent of intents) {
     if (intent.from === null || intent.from === undefined) continue;
@@ -1532,14 +1659,33 @@ function linkedFactIds(intents) {
       add(to, intent.from);
     }
   }
-  return links;
-}
-
-function medianY(ids, positions) {
-  const values = ids.map((id) => positions.get(id)?.y).filter((value) => value !== undefined).sort((left, right) => left - right);
-  if (!values.length) return null;
-  const middle = Math.floor(values.length / 2);
-  return values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+  const longest = columns.reduce((best, column) => Math.max(best, column.length), 0);
+  const ordered = [...columns].sort((left, right) => right.length - left.length);
+  for (const columnFacts of ordered) {
+    if (columnFacts.length === longest) continue;
+    const deltas = [];
+    for (const fact of columnFacts) {
+      const ys = (neighbors.get(fact.id) || [])
+        .map((id) => positions.get(id)?.y)
+        .filter((y) => y !== undefined)
+        .sort((left, right) => left - right);
+      if (!ys.length) continue;
+      const middle = Math.floor(ys.length / 2);
+      const median = ys.length % 2 ? ys[middle] : (ys[middle - 1] + ys[middle]) / 2;
+      deltas.push(median - positions.get(fact.id).y);
+    }
+    if (!deltas.length) continue;
+    deltas.sort((left, right) => left - right);
+    const mid = Math.floor(deltas.length / 2);
+    let delta = deltas.length % 2 ? deltas[mid] : (deltas[mid - 1] + deltas[mid]) / 2;
+    const minY = Math.min(...columnFacts.map((fact) => positions.get(fact.id).y));
+    const maxY = Math.max(...Array.from(positions.values(), (point) => point.y));
+    const columnMax = Math.max(...columnFacts.map((fact) => positions.get(fact.id).y));
+    delta = Math.max(delta, GRAPH.marginY - minY);
+    delta = Math.min(delta, maxY - columnMax);
+    if (!delta) continue;
+    for (const fact of columnFacts) positions.get(fact.id).y += delta;
+  }
 }
 
 function orderColumnsByParents(columns, intents) {
@@ -1586,15 +1732,15 @@ function orderColumnsByParents(columns, intents) {
       : columns.map((_, index) => columns.length - 1 - index);
     for (const columnIndex of order) {
       columns[columnIndex].sort((left, right) => {
-        if (left.id === 0) return right.id === 0 ? 0 : -1;
-        if (right.id === 0) return 1;
+        if (left.id === 0 || left.kind === "start") return right.id === 0 || right.kind === "start" ? 0 : -1;
+        if (right.id === 0 || right.kind === "start") return 1;
+        if (left.id === 1 || left.kind === "goal") return right.id === 1 || right.kind === "goal" ? 0 : 1;
+        if (right.id === 1 || right.kind === "goal") return -1;
         const neighbors = forward ? parents : children;
         const leftScore = scoreOf(left.id, neighbors.get(left.id));
         const rightScore = scoreOf(right.id, neighbors.get(right.id));
-        if (leftScore === null && rightScore === null) return left.id - right.id;
-        if (leftScore === null) return 1;
-        if (rightScore === null) return -1;
-        return leftScore - rightScore || left.id - right.id;
+        if (leftScore === null || rightScore === null) return 0;
+        return leftScore - rightScore;
       });
       reindex();
     }
@@ -1771,12 +1917,119 @@ function assignEdgePorts(edges, factPositions, intentPositions) {
   }
   const ports = new Map();
   for (const group of groups.values()) {
-    group.sort((left, right) => edgeTargetY(left, factPositions, intentPositions) - edgeTargetY(right, factPositions, intentPositions) || left.intent.id - right.intent.id || (left.to ?? -1) - (right.to ?? -1));
-    const step = group.length > 1 ? Math.min(16, 52 / (group.length - 1)) : 0;
-    const start = -((group.length - 1) * step) / 2;
-    group.forEach((edge, index) => ports.set(edge.key, start + index * step));
+    const byIntent = new Map();
+    for (const edge of group) {
+      if (!byIntent.has(edge.intent.id)) byIntent.set(edge.intent.id, []);
+      byIntent.get(edge.intent.id).push(edge);
+    }
+    const intents = [...byIntent.values()].sort((left, right) => {
+      const leftY = medianNumber(left.map((edge) => edgeTargetY(edge, factPositions, intentPositions)));
+      const rightY = medianNumber(right.map((edge) => edgeTargetY(edge, factPositions, intentPositions)));
+      return leftY - rightY || left[0].intent.id - right[0].intent.id;
+    });
+    const span = Math.min(64, Math.max(0, (intents.length - 1) * 14));
+    intents.forEach((intentEdges, index) => {
+      const port = intents.length === 1 ? 0 : -span / 2 + index * (span / (intents.length - 1));
+      intentEdges.forEach((edge) => ports.set(edge.key, port));
+    });
   }
   return ports;
+}
+
+function medianNumber(values) {
+  const sorted = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function edgeEndPoint(edge, factPositions, intentPositions) {
+  if (edge.to === null || edge.to === undefined) return intentPositions.get(edge.intent.id);
+  return factPositions.get(edge.to);
+}
+
+function assignEdgeRoutes(edges, factPositions, intentPositions) {
+  const routes = new Map();
+  const groups = new Map();
+  for (const edge of edges) {
+    const source = factPositions.get(edge.intent.from);
+    const target = edgeEndPoint(edge, factPositions, intentPositions);
+    if (!source || !target || !isAdjacentEdge(source, target)) continue;
+    const key = `${Math.round(source.x)}:${Math.round(target.x)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ edge, source, target });
+  }
+  for (const group of groups.values()) {
+    const bundles = new Map();
+    for (const item of group) {
+      const side = item.target.y >= item.source.y ? "down" : "up";
+      const key = `${item.edge.intent.id}:${side}`;
+      if (!bundles.has(key)) bundles.set(key, []);
+      bundles.get(key).push(item);
+    }
+    const items = [...bundles.values()].map((list) => {
+      list.sort((left, right) => left.target.y - right.target.y || (left.edge.to ?? -1) - (right.edge.to ?? -1));
+      const source = list[0].source;
+      return {
+        list,
+        source,
+        side: list[0].target.y >= source.y ? "down" : "up",
+        median: list[Math.floor((list.length - 1) / 2)].target.y,
+      };
+    });
+    items.sort((left, right) => (
+      right.source.y - left.source.y
+      || (left.side === right.side
+        ? (left.side === "down" ? right.median - left.median : left.median - right.median)
+        : (left.side === "up" ? -1 : 1))
+      || left.list[0].edge.intent.id - right.list[0].edge.intent.id
+    ));
+    const leftX = group[0].source.x + 106;
+    const rightX = group[0].target.x - 106;
+    items.forEach((bundle, index) => {
+      bundle.x = items.length === 1
+        ? (leftX + rightX) / 2
+        : leftX + (index + 0.5) * (rightX - leftX) / items.length;
+    });
+    const bySource = new Map();
+    for (const bundle of items) {
+      const key = `${bundle.source.x}:${bundle.source.y}`;
+      if (!bySource.has(key)) bySource.set(key, []);
+      bySource.get(key).push(bundle);
+    }
+    for (const list of bySource.values()) {
+      const sourceY = list[0].source.y;
+      const place = (arr, direction) => {
+        if (!arr.length) return;
+        const step = arr.length <= 1 ? 0 : Math.min(12, 34 / (arr.length - 1));
+        arr.forEach((bundle, index) => {
+          const rank = arr.length - 1 - index;
+          bundle.trackY = sourceY + direction * rank * step;
+        });
+      };
+      place(list.filter((bundle) => bundle.side === "up"), -1);
+      place(list.filter((bundle) => bundle.side === "down"), 1);
+    }
+    const labelEdge = new Map();
+    for (const bundle of items) {
+      for (const item of bundle.list) {
+        const previous = labelEdge.get(item.edge.intent.id);
+        const distance = Math.abs(item.target.y - item.source.y);
+        const previousDistance = previous ? Math.abs(previous.target.y - previous.source.y) : -1;
+        if (!previous || distance > previousDistance) labelEdge.set(item.edge.intent.id, item);
+      }
+    }
+    for (const bundle of items) {
+      for (const item of bundle.list) {
+        routes.set(item.edge.key, {
+          x: bundle.x,
+          trackY: bundle.trackY,
+          label: labelEdge.get(item.edge.intent.id) === item,
+        });
+      }
+    }
+  }
+  return routes;
 }
 
 function edgeTargetY(edge, factPositions, intentPositions) {
@@ -1816,11 +2069,32 @@ function routeEdge(source, target, options) {
   const sourceHalf = options.sourceHalf ?? 92;
   const targetHalf = options.targetHalf ?? 92;
   const port = options.port || 0;
+  if (Math.abs(target.x - source.x) < 24) {
+    const direction = Math.sign(target.y - source.y) || 1;
+    const startY = source.y + direction * Math.min(sourceHalf, 46);
+    const endY = target.y - direction * Math.min(targetHalf, 28);
+    return {
+      path: `M ${source.x} ${startY} L ${target.x} ${endY}`,
+      labelX: source.x + 18,
+      labelY: (startY + endY) / 2,
+    };
+  }
   const forward = target.x >= source.x;
   const startX = source.x + (forward ? sourceHalf + 14 : -(sourceHalf + 14));
   const endX = target.x - (forward ? targetHalf + 14 : -(targetHalf + 14));
   const startY = source.y + port;
   const endY = target.y;
+  if (options.laneY === undefined && options.trunkX !== undefined && options.trackY !== undefined && isAdjacentEdge(source, target)) {
+    const trunkX = options.trunkX;
+    const trackY = options.trackY;
+    const path = `M ${startX} ${trackY} L ${trunkX} ${trackY} L ${trunkX} ${endY} L ${endX} ${endY}`;
+    return {
+      path,
+      labelX: (trunkX + endX) / 2,
+      labelY: endY - 16,
+      showLabel: options.showLabel !== false,
+    };
+  }
   if (options.laneY === undefined && isAdjacentEdge(source, target)) {
     const dx = endX - startX;
     const c1x = startX + dx * 0.42;
@@ -1833,7 +2107,7 @@ function routeEdge(source, target, options) {
       { x: endX, y: endY },
       0.5,
     );
-    return { path, labelX: mid.x, labelY: mid.y - 12 };
+    return { path, labelX: mid.x, labelY: mid.y - 12, showLabel: true };
   }
   const laneY = options.laneY ?? (Math.min(startY, endY) - 84);
   const outX = startX + (forward ? 28 : -28);
@@ -2107,9 +2381,6 @@ function clearCurrentProject() {
   state.selectedIntentId = null;
   els.title.textContent = "选择项目";
   els.subtitle.textContent = "查看任务输入、fact / intent 图和运行状态";
-  [...els.summary.querySelectorAll("strong")].forEach((node) => {
-    node.textContent = "-";
-  });
   els.graph.innerHTML = "";
   els.cryptoInputs.hidden = true;
   els.cryptoInputList.innerHTML = "";
@@ -2127,7 +2398,7 @@ function clearCurrentProject() {
   state.writeupStatus = null;
   state.tokenUsage = null;
   stopWriteupPoll();
-  renderTokenSummary();
+  renderProjectMeta();
   renderRunStatus();
   updateActionButtons();
 }

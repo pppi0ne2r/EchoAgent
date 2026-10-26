@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EchoAgent Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=38" />
+    <link rel="stylesheet" href="/static/styles.css?v=42" />
   </head>
   <body>
     <header class="topbar">
@@ -116,12 +116,29 @@
           </div>
         </div>
 
-        <div class="summary-row" id="summary-row">
-          <div><span>状态</span><strong>-</strong></div>
-          <div><span>目标</span><strong>-</strong></div>
-          <div><span>图</span><strong>-</strong></div>
-          <div><span>调度</span><strong>-</strong></div>
-          <div><span>Token</span><strong>-</strong><em id="token-breakdown"></em></div>
+        <div class="project-meta" id="project-meta">
+          <div class="meta-line">
+            <div class="meta-field">
+              <span>状态</span>
+              <span class="meta-value">
+                <span id="project-status" class="badge empty">-</span>
+                <span id="project-queue" class="badge queued" hidden>排队中</span>
+              </span>
+            </div>
+            <div class="meta-field">
+              <span>图</span>
+              <strong id="project-counts">-</strong>
+            </div>
+            <div class="meta-field">
+              <span>Token</span>
+              <strong id="token-total">-</strong>
+            </div>
+          </div>
+          <p id="token-breakdown" class="meta-breakdown"></p>
+          <div class="meta-target">
+            <span>目标</span>
+            <strong id="project-target">-</strong>
+          </div>
         </div>
         <div id="crypto-inputs" class="crypto-inputs" hidden>
           <strong id="crypto-input-title">输入清单</strong>
@@ -328,6 +345,6 @@
       </form>
     </section>
 
-    <script src="/static/app.js?v=48"></script>
+    <script src="/static/app.js?v=55"></script>
   </body>
 </html>
