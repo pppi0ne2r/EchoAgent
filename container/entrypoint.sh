@@ -19,26 +19,4 @@ if ! python3 -c 'import socket; socket.create_connection(("127.0.0.1", 8000), 0.
     >>/tmp/pyghidra-mcp.log 2>&1 &
 fi
 
-# pyghidra-mcp 在后台启动。等它开始监听后再交给主进程，避免 Codex 立刻连上被拒绝。
-if python3 - <<'PY'
-import socket
-import sys
-import time
-
-deadline = time.monotonic() + 60
-while time.monotonic() < deadline:
-    try:
-        socket.create_connection(("127.0.0.1", 8000), 0.3).close()
-    except OSError:
-        time.sleep(0.5)
-        continue
-    sys.exit(0)
-sys.exit(1)
-PY
-then
-  echo "pyghidra-mcp is listening on 127.0.0.1:8000" >&2
-else
-  echo "pyghidra-mcp did not listen on 127.0.0.1:8000; continuing" >&2
-fi
-
 exec "$@"

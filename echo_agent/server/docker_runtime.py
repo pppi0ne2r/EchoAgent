@@ -241,7 +241,7 @@ class DockerProjectRuntime:
         for host_path, container_path, read_only in mounts:
             mode = "ro" if read_only else "rw"
             command.extend(["-v", f"{host_path}:{container_path}:{mode}"])
-        command.extend(["--entrypoint", "/opt/echo-agent/entrypoint.sh", self.image, *self.keepalive_command])
+        command.extend([self.image, *self.keepalive_command])
         return command
 
     def start_project_container(self, project: Project, log: DockerLogCallback | None = None) -> None:

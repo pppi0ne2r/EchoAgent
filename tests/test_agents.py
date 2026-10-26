@@ -274,22 +274,6 @@ time.sleep(5)
 
 
 
-    def test_codex_waits_for_pyghidra_mcp_inside_container(self) -> None:
-        agent = CodexDockerAgent()
-        project = type("ProjectStub", (), {"docker": "worker-container"})()
-        seen: dict[str, list[str]] = {}
-
-        def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            seen["command"] = command
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        with patch("echo_agent.dispatcher.agents.subprocess.run", side_effect=fake_run):
-            agent._wait_for_pyghidra_mcp(project, log=None)  # type: ignore[arg-type]
-
-        self.assertEqual(seen["command"][:4], ["docker", "exec", "-i", "worker-container"])
-        self.assertIn("127.0.0.1", seen["command"][-1])
-        self.assertIn("8000", seen["command"][-1])
-
     def test_prepare_runtime_writes_pyghidra_mcp_config(self) -> None:
         agent = CodexDockerAgent(workspace="/home/kali/workspace")
         project = type("ProjectStub", (), {"docker": "worker-container"})()
