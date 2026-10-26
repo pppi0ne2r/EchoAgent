@@ -72,7 +72,7 @@ class ExtensionCatalogTests(unittest.TestCase):
             catalog_path.write_text(
                 json.dumps(
                     {
-                        "builtins_version": 2,
+                        "builtins_version": 3,
                         "items": [
                             {
                                 "id": "tool-ysoserial",
@@ -175,6 +175,65 @@ class ExtensionBuiltinUpgradeTests(unittest.TestCase):
             reopened = ExtensionCatalog(path, root / "resources")
             self.assertNotIn("katana", {item.name for item in reopened.list_items()})
 
+    def test_old_catalog_gains_ctf_skills_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "extensions.json"
+            path.write_text(json.dumps({"builtins_version": 2, "items": []}), encoding="utf-8")
+            catalog = ExtensionCatalog(path, root / "resources")
+            preset = next(item for item in catalog.list_items() if item.name == "ctf-skills")
+            self.assertEqual(preset.kind, "skill")
+            self.assertEqual(preset.url, "https://github.com/ljagiello/ctf-skills")
+            reopened = ExtensionCatalog(path, root / "resources")
+            self.assertEqual(
+                [item.id for item in reopened.list_items() if item.name == "ctf-skills"],
+                [preset.id],
+            )
+
+    def test_skill_repository_preset_installs_without_duplicating_existing_skills(self) -> None:
+        content = io.BytesIO()
+        with zipfile.ZipFile(content, "w") as archive:
+            archive.writestr(
+                "repo-main/ctf-web/SKILL.md",
+                "---\nname: ctf-web\ndescription: web skill\n---\n# web\n",
+            )
+            archive.writestr(
+                "repo-main/ctf-pwn/SKILL.md",
+                "---\nname: ctf-pwn\ndescription: pwn skill\n---\n# pwn\n",
+            )
+            archive.writestr("repo-main/ctf-pwn/notes.md", "keep")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "extensions.json"
+            preset = next(item for item in builtin_extensions() if item.name == "ctf-skills")
+            path.write_text(
+                json.dumps({"builtins_version": 3, "items": [preset.to_dict()]}),
+                encoding="utf-8",
+            )
+            catalog = ExtensionCatalog(path, root / "resources")
+            catalog.import_local(
+                "skill",
+                "SKILL.md",
+                b"---\nname: ctf-web\ndescription: already\n---\n",
+            )
+            runtime = DockerProjectRuntime(
+                image="worker:test",
+                context=Path("container"),
+                dockerfile=Path("container/Dockerfile"),
+                resource_root=root / "resources",
+                extensions=catalog,
+            )
+            with patch("echo_agent.server.extensions.download_github_zipball", return_value=content.getvalue()):
+                failures = runtime.prepare_extensions()
+            self.assertEqual(failures, [])
+            names = [item.name for item in catalog.list_items()]
+            self.assertEqual(names.count("ctf-web"), 1)
+            self.assertIn("ctf-pwn", names)
+            self.assertNotIn("ctf-skills", names)
+            self.assertTrue((root / "resources" / "skills" / "ctf-pwn" / "SKILL.md").is_file())
+            self.assertEqual((root / "resources" / "skills" / "ctf-pwn" / "notes.md").read_text(), "keep")
+            self.assertTrue((root / "resources" / "skills" / "ctf-web" / "SKILL.md").is_file())
+
 
 class ExtensionUpdateTests(unittest.TestCase):
     def test_update_replaces_existing_file_and_directory(self) -> None:
@@ -189,7 +248,7 @@ class ExtensionUpdateTests(unittest.TestCase):
             catalog_path.write_text(
                 json.dumps(
                     {
-                        "builtins_version": 2,
+                        "builtins_version": 3,
                         "items": [
                             {
                                 "id": "tool-katana",
@@ -547,7 +606,7 @@ class LocalExtensionImportTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 catalog.import_local("skill", "too-deep.zip", payload.getvalue())
             self.assertIn("只套一层目录", str(caught.exception))
-            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+            self.assertEqual([item.name for item in catalog.list_items() if item.kind == "skill"], ["ctf-skills"])
 
     def test_local_tool_and_knowledge_files_are_installed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -628,7 +687,7 @@ class SkillRepositoryImportTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     catalog.import_skill_repository("https://github.com/acme/empty")
             self.assertIn("没有可导入的 Skill", str(caught.exception))
-            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+            self.assertEqual([item.name for item in catalog.list_items() if item.kind == "skill"], ["ctf-skills"])
             self.assertFalse((root / "resources" / "imports").exists())
 
     def test_existing_skill_name_blocks_entire_import(self) -> None:
@@ -732,7 +791,7 @@ class SkillRepositoryImportTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     catalog.import_skill_repository("https://github.com/acme/broken")
             self.assertIn("不会加载", str(caught.exception))
-            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+            self.assertEqual([item.name for item in catalog.list_items() if item.kind == "skill"], ["ctf-skills"])
 
     def test_unsafe_zip_path_adds_nothing(self) -> None:
         payload = io.BytesIO()
@@ -745,7 +804,7 @@ class SkillRepositoryImportTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     catalog.import_skill_repository("https://github.com/acme/evil")
             self.assertIn("路径不安全", str(caught.exception))
-            self.assertFalse(any(item.kind == "skill" for item in catalog.list_items()))
+            self.assertEqual([item.name for item in catalog.list_items() if item.kind == "skill"], ["ctf-skills"])
 
 
 class KnowledgeRepositoryImportTests(unittest.TestCase):

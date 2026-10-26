@@ -121,6 +121,13 @@ def builtin_extensions() -> list[ExtensionItem]:
             container_path="/home/kali/.local/nuclei-templates",
             read_only=False,
         ),
+        ExtensionItem(
+            id="skill-ctf-skills",
+            kind="skill",
+            name="ctf-skills",
+            url="https://github.com/ljagiello/ctf-skills",
+            github_repo="ljagiello/ctf-skills",
+        ),
     ]
 
 
@@ -166,7 +173,7 @@ def extension_resource(item: ExtensionItem) -> ProjectResource:
     )
 
 
-BUILTIN_VERSION = 2
+BUILTIN_VERSION = 3
 
 
 def _resource_size(path: Path) -> int | None:
@@ -274,7 +281,13 @@ class ExtensionCatalog:
         _reject_webpage_link(url)
         return self.add(cleaned_kind, name_from_download_url(url), url)
 
-    def import_skill_repository(self, link: str) -> list[ExtensionItem]:
+    def import_skill_repository(
+        self,
+        link: str,
+        *,
+        skip_existing: bool = False,
+        ignore_ids: set[str] | None = None,
+    ) -> list[ExtensionItem]:
         repo = github_repo_homepage(link)
         if not repo:
             raise ValueError("请填写 GitHub 仓库主页，例如 https://github.com/ljagiello/ctf-skills")
@@ -283,15 +296,21 @@ class ExtensionCatalog:
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise ValueError(f"{duplicates[0]} 在仓库里出现了多次")
-        existing = [item for item in self.list_items() if item.kind == "skill"]
+        ignored = ignore_ids or set()
+        existing = [item for item in self.list_items() if item.kind == "skill" and item.id not in ignored]
         existing_names = {item.name for item in existing}
         existing_slugs = {_slug(item.name) for item in existing}
         slugs = [_slug(name) for name in names]
         if len(slugs) != len(set(slugs)):
             raise ValueError("这些 Skill 会安装到同一个目录")
-        for name, slug in zip(names, slugs):
+        selected: list[tuple[str, bytes]] = []
+        for (name, payload), slug in zip(packages, slugs):
             if name in existing_names or slug in existing_slugs:
+                if skip_existing:
+                    continue
                 raise ValueError(f"{name} already exists")
+            selected.append((name, payload))
+        packages = selected
         created: list[ExtensionItem] = []
         written: list[Path] = []
         try:
@@ -316,6 +335,16 @@ class ExtensionCatalog:
                 if parent.is_dir() and not any(parent.iterdir()):
                     parent.rmdir()
             raise
+        return created
+
+    def materialize_skill_repository(self, item_id: str) -> list[ExtensionItem]:
+        item = next((entry for entry in self.list_items() if entry.id == item_id), None)
+        if item is None:
+            raise KeyError(item_id)
+        if item.kind != "skill" or not github_repo_homepage(item.url):
+            raise ValueError("这不是 GitHub Skill 仓库")
+        created = self.import_skill_repository(item.url, skip_existing=True, ignore_ids={item_id})
+        self.delete(item_id)
         return created
 
     def import_knowledge_repository(self, link: str) -> ExtensionItem:

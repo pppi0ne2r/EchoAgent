@@ -17,7 +17,7 @@ from echo_agent.config import ServerSettings
 from echo_agent.crypto_files import CryptoProjectFiles
 from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, DEFAULT_MEMORY_MB
 from echo_agent.models import Project, ProjectStatus
-from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError, extension_resource
+from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError, extension_resource, github_repo_homepage
 from echo_agent.server.attachments import CONTAINER_ATTACHMENT_DIR
 from echo_agent.server.project_workspace import CONTAINER_WORK_DIR, ProjectWorkspace
 
@@ -35,6 +35,7 @@ def _container_path_covered(container_path: str, occupied: set[str]) -> bool:
     if container_path in occupied:
         return True
     return any(container_path.startswith(f"{dest}/") for dest in occupied if dest)
+
 
 
 def _format_cpus(value: float) -> str:
@@ -164,6 +165,22 @@ class DockerProjectRuntime:
             if kind is not None and item.kind != kind:
                 continue
             matched = True
+            if item.kind == "skill" and github_repo_homepage(item.url):
+                try:
+                    created = catalog.materialize_skill_repository(item.id)
+                except ValueError as exc:
+                    message = str(exc)
+                    catalog.set_error(item.id, message)
+                    failures.append({"id": item.id, "kind": item.kind, "name": item.name, "error": message})
+                    continue
+                for created_item in created:
+                    try:
+                        self._prepare_one_resource(root, extension_resource(created_item), log=log, force=force)
+                    except DockerRuntimeError as exc:
+                        message = str(exc)
+                        catalog.set_error(created_item.id, message)
+                        failures.append({"id": created_item.id, "kind": created_item.kind, "name": created_item.name, "error": message})
+                continue
             host_path = catalog.host_path(resource)
             if (force or not self._resource_exists(host_path)) and item.github_repo:
                 try:
