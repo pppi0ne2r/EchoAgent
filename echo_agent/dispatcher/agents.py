@@ -183,6 +183,7 @@ class CodexDockerAgent:
         try:
             if crypto_worker:
                 self._set_crypto_memory_limit(project.docker, self._run_state.crypto_budget)
+            self._wait_for_pyghidra_mcp(project, log=log)
             self._run_preflight(project, log=log)
             if runtime_key is not None:
                 self._prepare_runtime(project, runtime_key, log=log)
@@ -374,6 +375,46 @@ class CodexDockerAgent:
         )
         command.extend(["-w", self.workspace, project.docker, "sh", "-lc", script])
         return command
+
+    def _wait_for_pyghidra_mcp(self, project: Project, log: AgentLogCallback | None) -> None:
+        container = project.docker or ""
+        if not container:
+            return
+        script = (
+            "import socket, sys, time\n"
+            "deadline = time.monotonic() + 60\n"
+            "while time.monotonic() < deadline:\n"
+            "    try:\n"
+            "        socket.create_connection(('127.0.0.1', 8000), 0.3).close()\n"
+            "    except OSError:\n"
+            "        time.sleep(0.5)\n"
+            "        continue\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+        command = ["docker", "exec", "-i", container, "python3", "-c", script]
+        self._log(log, "waiting for pyghidra-mcp", metadata={"docker": container})
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=70,
+                check=False,
+                env=self._subprocess_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._log(log, "pyghidra-mcp wait failed", "warning", {"error": str(exc)})
+            return
+        if completed.returncode == 0:
+            self._log(log, "pyghidra-mcp is listening", metadata={"docker": container})
+            return
+        self._log(
+            log,
+            "pyghidra-mcp was not listening before codex started",
+            "warning",
+            {"docker": container},
+        )
 
     def _run_preflight(self, project: Project, log: AgentLogCallback | None) -> None:
         container = project.docker or ""

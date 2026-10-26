@@ -18,6 +18,7 @@ from echo_agent.system_proxy import (
     _identity_is_proxy,
     _looks_like_http_proxy,
     _loopback_ports_in_proc,
+    _probe_http_proxy,
     configured_proxy_environment,
     container_proxy_environment,
     container_proxy_signature,
@@ -251,12 +252,63 @@ class SystemProxyTests(unittest.TestCase):
         with (
             patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
             patch("echo_agent.system_proxy._tcp_open", side_effect=lambda host, _port: host == "127.0.0.1"),
+            patch("echo_agent.system_proxy._proxy_on_gateway", return_value=False),
             patch("echo_agent.system_proxy.socket.socket", return_value=Listener()),
             patch("echo_agent.system_proxy.threading.Thread"),
         ):
             ensure_container_proxy_reachable({"https_proxy": "http://echo-agent-host:7890"})
         _forwarded_ports.clear()
         self.assertEqual(binds, [("172.17.0.1", 7890)])
+
+    def test_tcp_accept_without_proxy_response_still_forwards(self) -> None:
+        from echo_agent.system_proxy import _forwarded_ports, ensure_container_proxy_reachable
+
+        binds: list[tuple[str, int]] = []
+
+        class Listener:
+            def setsockopt(self, *_args: object) -> None:
+                return None
+
+            def bind(self, address: tuple[str, int]) -> None:
+                binds.append(address)
+
+            def listen(self, _backlog: int) -> None:
+                return None
+
+        _forwarded_ports.clear()
+        with (
+            patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
+            patch("echo_agent.system_proxy._tcp_open", return_value=True),
+            patch("echo_agent.system_proxy._proxy_on_gateway", return_value=False),
+            patch("echo_agent.system_proxy.socket.socket", return_value=Listener()),
+            patch("echo_agent.system_proxy.threading.Thread"),
+        ):
+            ensure_container_proxy_reachable({"https_proxy": "http://echo-agent-host:7892"})
+        _forwarded_ports.clear()
+        self.assertEqual(binds, [("172.17.0.1", 7892)])
+
+    def test_silent_tcp_accept_is_not_a_proxy(self) -> None:
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def accept_and_hold() -> None:
+            connection, _address = server.accept()
+            time.sleep(0.6)
+            connection.close()
+
+        thread = threading.Thread(target=accept_and_hold)
+        thread.start()
+        try:
+            self.assertIsNone(_probe_http_proxy("127.0.0.1", port, timeout=0.2))
+        finally:
+            thread.join(timeout=2)
+            server.close()
+
+    def test_entrypoint_waits_for_mcp_before_main_process(self) -> None:
+        script = Path("container/entrypoint.sh").read_text()
+        self.assertLess(script.index("pyghidra-mcp is listening"), script.index('exec "$@"'))
 
     def test_missing_gateway_address_starts_namespace_forwarder(self) -> None:
         from echo_agent.system_proxy import _forwarded_ports, _namespace_forwarders, ensure_container_proxy_reachable
@@ -276,6 +328,7 @@ class SystemProxyTests(unittest.TestCase):
         with (
             patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
             patch("echo_agent.system_proxy._tcp_open", side_effect=lambda host, _port: host == "127.0.0.1"),
+            patch("echo_agent.system_proxy._proxy_on_gateway", return_value=False),
             patch("echo_agent.system_proxy.socket.socket", return_value=MissingAddress()),
             patch("echo_agent.system_proxy._start_namespace_forwarder", return_value=True) as start,
         ):
@@ -302,6 +355,7 @@ class SystemProxyTests(unittest.TestCase):
         with (
             patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
             patch("echo_agent.system_proxy._tcp_open", side_effect=lambda host, _port: host == "127.0.0.1"),
+            patch("echo_agent.system_proxy._proxy_on_gateway", return_value=False),
             patch("echo_agent.system_proxy.socket.socket", return_value=MissingAddress()),
             patch("echo_agent.system_proxy._pid_with_local_address", return_value=None),
             patch("echo_agent.system_proxy._spawn_netns_forwarder") as spawn,

@@ -309,24 +309,53 @@ def _identity_is_proxy(command: str, arguments: str) -> bool:
     return any(marker in identity for marker in _PROXY_PROCESS_MARKERS)
 
 
-def _looks_like_http_proxy(port: int) -> bool:
+def _proxy_on_gateway(host: str, port: int) -> bool:
+    """网桥地址只有在真正返回 HTTP 或 SOCKS 响应时才算已经转发。"""
+    result = _probe_http_proxy(host, port)
+    if result is True:
+        return True
+    if result is None:
+        _forwarder_log(
+            f"{host}:{port} accepted a connection but returned no proxy response; starting forwarder"
+        )
+        return False
+    return _looks_like_socks_proxy(port, host)
+
+
+def _looks_like_http_proxy(port: int, host: str = "127.0.0.1") -> bool:
+    return _probe_http_proxy(host, port) is True
+
+
+def _probe_http_proxy(host: str, port: int, timeout: float = _PROXY_PROBE_TIMEOUT) -> bool | None:
+    """True 是 HTTP 代理，False 是连不上或响应不是 HTTP，None 是连上后一直没有响应。"""
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=_PROXY_PROBE_TIMEOUT) as sock:
-            sock.settimeout(_PROXY_PROBE_TIMEOUT)
-            sock.sendall(
-                b"GET http://127.0.0.1:1/ HTTP/1.1\r\n"
-                b"Host: 127.0.0.1:1\r\n"
-                b"Connection: close\r\n\r\n"
-            )
-            data = sock.recv(16)
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except TimeoutError:
+        return None
     except OSError:
         return False
-    return data.startswith(b"HTTP/")
-
-
-def _looks_like_socks_proxy(port: int) -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=_PROXY_PROBE_TIMEOUT) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(
+            b"GET http://127.0.0.1:1/ HTTP/1.1\r\n"
+            b"Host: 127.0.0.1:1\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        data = sock.recv(16)
+    except TimeoutError:
+        return None
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    if data.startswith(b"HTTP/"):
+        return True
+    return None if not data else False
+
+
+def _looks_like_socks_proxy(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=_PROXY_PROBE_TIMEOUT) as sock:
             sock.settimeout(_PROXY_PROBE_TIMEOUT)
             sock.sendall(b"\x05\x01\x00")
             data = sock.recv(2)
@@ -519,7 +548,10 @@ def _ensure_forwarder(port: int) -> None:
         if _forwarder_is_running(port):
             return
         gateway = _docker_bridge_gateway()
-        if not gateway or _tcp_open(gateway, port) or not _tcp_open("127.0.0.1", port):
+        if not gateway or not _tcp_open("127.0.0.1", port):
+            return
+        # 只完成 TCP 握手不算转发可用。172.17.0.1 可能接受连接但不返回代理响应。
+        if _proxy_on_gateway(gateway, port):
             return
         try:
             listener = _bound_listener(gateway, port)
