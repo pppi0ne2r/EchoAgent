@@ -144,6 +144,37 @@ class ConsoleSettingsTests(unittest.TestCase):
         self.assertTrue(loaded.clash_enabled)
         self.assertEqual(loaded.clash_subscription_url, "https://example.com/sub")
 
+    def test_container_limits_round_trip_without_replacing_the_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text(MINIMAL_CONFIG, encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                saved = save_console_settings(
+                    max_concurrent_projects=2,
+                    codex_max_slots=2,
+                    explore_max_workers=4,
+                    base_url="https://gateway.example/v1",
+                    model="grok-4.7",
+                    container_memory_mb=2048,
+                    container_cpus=1.5,
+                )
+                loaded = DispatcherSettings.from_env()
+                with self.assertRaises(ValueError):
+                    save_console_settings(
+                        max_concurrent_projects=2,
+                        codex_max_slots=2,
+                        explore_max_workers=4,
+                        base_url="https://gateway.example/v1",
+                        model="grok-4.7",
+                        container_memory_mb=-1,
+                    )
+
+        self.assertEqual(saved["container_memory_mb"], 2048)
+        self.assertEqual(saved["container_cpus"], 1.5)
+        self.assertEqual(loaded.container_memory_mb, 2048)
+        self.assertEqual(loaded.container_cpus, 1.5)
+        self.assertEqual(loaded.project_docker_image, "worker:test")
+
 
 if __name__ == "__main__":
     unittest.main()

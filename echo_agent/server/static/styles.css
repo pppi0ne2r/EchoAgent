@@ -1231,7 +1231,8 @@ input[type="checkbox"] {
 
   .extension-form,
   .settings-split,
-  .settings-body {
+  .settings-body,
+  .settings-clash {
     grid-template-columns: 1fr;
   }
 
@@ -1314,8 +1315,28 @@ input[type="checkbox"] {
   line-height: 1.45;
 }
 
-.settings-card-wide {
-  grid-column: 1 / -1;
+.settings-stack {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.settings-card-side {
+  align-self: stretch;
+}
+
+.settings-subsection {
+  display: grid;
+  gap: 12px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.settings-clash {
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  gap: 12px;
+  align-items: end;
 }
 
 .settings-split {

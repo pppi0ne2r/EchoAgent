@@ -19,6 +19,8 @@ def save_console_settings(
     clear_api_key: bool = False,
     clash_enabled: bool = False,
     clash_subscription_url: str = "",
+    container_memory_mb: int = 0,
+    container_cpus: float = 0,
 ) -> dict[str, object]:
     if max_concurrent_projects < 1:
         raise ValueError("max_concurrent_projects must be at least 1")
@@ -39,6 +41,16 @@ def save_console_settings(
         raise ValueError("Clash 订阅地址必须以 http:// 或 https:// 开头，且不能包含空白")
     if clash_enabled and not subscription:
         raise ValueError("启用 Clash 时需要填写 http 或 https 订阅地址")
+    if isinstance(container_memory_mb, bool) or not isinstance(container_memory_mb, int):
+        raise ValueError("容器内存上限需要是整数")
+    if container_memory_mb < 0 or container_memory_mb > 131072:
+        raise ValueError("容器内存上限需要在 0 到 131072 MB 之间，0 表示不限制")
+    try:
+        cpus = float(container_cpus)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("容器 CPU 上限需要是数字") from exc
+    if isinstance(container_cpus, bool) or cpus != cpus or cpus < 0 or cpus > 64:
+        raise ValueError("容器 CPU 上限需要在 0 到 64 之间，0 表示不限制")
     if clear_api_key:
         stored_key = ""
     elif api_key and api_key.strip():
@@ -69,6 +81,10 @@ def save_console_settings(
                 "[clash]",
                 f"enabled = {'true' if clash_enabled else 'false'}",
                 f"subscription_url = {_toml_string(subscription)}",
+                "",
+                "[docker]",
+                f"memory_mb = {container_memory_mb}",
+                f"cpus = {_toml_cpus(cpus)}",
                 "",
             ]
         ),
@@ -101,7 +117,14 @@ def _public_settings(settings: DispatcherSettings) -> dict[str, object]:
         "api_key_hint": key[-4:] if len(key) > 4 else "",
         "clash_enabled": settings.clash_enabled,
         "clash_subscription_url": settings.clash_subscription_url,
+        "container_memory_mb": settings.container_memory_mb,
+        "container_cpus": settings.container_cpus,
     }
+
+
+def _toml_cpus(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _toml_string(value: str) -> str:

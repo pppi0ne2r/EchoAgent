@@ -78,6 +78,10 @@ image = "echo-agent-worker"
 context = "container"
 dockerfile = "container/Dockerfile"
 build_network = "host"
+# Optional limits for ordinary project containers. 0 means no Docker limit.
+# Crypto projects keep their own budget and ignore these values.
+# memory_mb = 0
+# cpus = 0
 [resources]
 # Host directory for the extension catalog. Tools, knowledge bases, and skills
 # are configured in the web UI, not as a second resource list.

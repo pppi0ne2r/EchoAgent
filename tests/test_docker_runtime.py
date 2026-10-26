@@ -371,5 +371,62 @@ class ClashContainerTests(unittest.TestCase):
         self.assertEqual(runtime.commands, [])
 
 
+class ContainerLimitTests(unittest.TestCase):
+    def test_ordinary_container_uses_configured_limits_and_crypto_keeps_its_budget(self) -> None:
+        runtime = DockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+        )
+        settings = type(
+            "Settings",
+            (),
+            {
+                "clash_enabled": False,
+                "clash_subscription_url": "",
+                "container_memory_mb": 2048,
+                "container_cpus": 1.5,
+            },
+        )()
+        with patch("echo_agent.config.DispatcherSettings.from_env", return_value=settings):
+            ordinary = runtime._docker_run_command("echo-agent-task-7", [])
+            crypto = runtime._docker_run_command("echo-agent-task-8", [], crypto=True)
+        self.assertIn("--memory", ordinary)
+        self.assertIn("2048m", ordinary)
+        self.assertIn("--cpus", ordinary)
+        self.assertIn("1.5", ordinary)
+        self.assertNotIn("--pids-limit", ordinary)
+        self.assertIn("1024m", crypto)
+        self.assertIn("2", crypto)
+        self.assertNotIn("2048m", crypto)
+
+    def test_stopped_container_is_recreated_when_limits_change(self) -> None:
+        runtime = StatefulDockerProjectRuntime(
+            image="worker:test",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+            image_exists=True,
+            container_state="exited",
+        )
+        object.__setattr__(runtime, "_container_env", lambda container: ["PATH=/usr/bin"])
+        object.__setattr__(runtime, "_container_limits", lambda container: (0, 0))
+        project = Project(id=7, name="task-7", docker="echo-agent-task-7")
+        settings = type(
+            "Settings",
+            (),
+            {
+                "clash_enabled": False,
+                "clash_subscription_url": "",
+                "container_memory_mb": 2048,
+                "container_cpus": 0,
+            },
+        )()
+        with patch("echo_agent.config.DispatcherSettings.from_env", return_value=settings):
+            runtime.start_project_container(project)
+        self.assertEqual(runtime.commands[0][:3], ["docker", "rm", "-f"])
+        self.assertIn("2048m", runtime.commands[1])
+        self.assertNotIn("--cpus", runtime.commands[1])
+
+
 if __name__ == "__main__":
     unittest.main()

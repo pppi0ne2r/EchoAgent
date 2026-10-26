@@ -96,6 +96,8 @@ class ConsoleSettingsUpdate(BaseModel):
     clear_api_key: bool = False
     clash_enabled: bool = False
     clash_subscription_url: str = ""
+    container_memory_mb: int = Field(default=0, ge=0, le=131072)
+    container_cpus: float = Field(default=0, ge=0, le=64)
 
 
 class ExtensionCreateRequest(BaseModel):

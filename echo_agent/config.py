@@ -77,6 +77,8 @@ class DispatcherSettings:
     project_docker_build_network: str | None
     clash_enabled: bool = False
     clash_subscription_url: str = ""
+    container_memory_mb: int = 0
+    container_cpus: float = 0.0
     project_resource_root: Path
     project_resources: tuple[ProjectResource, ...] = ()
     codex_command: tuple[str, ...]
@@ -257,6 +259,18 @@ class DispatcherSettings:
                 _config_value(config, "clash", "subscription_url", default=""),
             )
             or "",
+            container_memory_mb=_bounded_int(
+                "ECHO_AGENT_CONTAINER_MEMORY_MB",
+                _config_value(config, "docker", "memory_mb", default=0),
+                maximum=131072,
+                label="docker.memory_mb",
+            ),
+            container_cpus=_bounded_float(
+                "ECHO_AGENT_CONTAINER_CPUS",
+                _config_value(config, "docker", "cpus", default=0),
+                maximum=64,
+                label="docker.cpus",
+            ),
             project_resource_root=_path_setting(
                 config,
                 _setting(
@@ -431,6 +445,34 @@ def _path_setting(config: dict[str, Any], value: Any) -> Path:
     if isinstance(config_dir, Path):
         return config_dir / path
     return path
+
+
+def _bounded_int(env_name: str, config_value: Any, *, maximum: int, label: str) -> int:
+    value = _bounded_number(env_name, config_value, maximum=maximum, label=label)
+    if value != int(value):
+        raise ValueError(f"EchoAgent config {label} must be an integer")
+    return int(value)
+
+
+def _bounded_float(env_name: str, config_value: Any, *, maximum: float, label: str) -> float:
+    return _bounded_number(env_name, config_value, maximum=maximum, label=label)
+
+
+def _bounded_number(env_name: str, config_value: Any, *, maximum: float, label: str) -> float:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        raw = config_value
+    if raw is None or raw == "":
+        return 0
+    if isinstance(raw, bool):
+        raise ValueError(f"EchoAgent config {label} must be a number")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"EchoAgent config {label} must be a number") from exc
+    if value != value or value < 0 or value > maximum:
+        raise ValueError(f"EchoAgent config {label} must be between 0 and {maximum:g}")
+    return value
 
 
 def _optional_bool(env_name: str, config_value: Any) -> bool:

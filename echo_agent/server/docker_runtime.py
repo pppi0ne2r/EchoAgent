@@ -37,6 +37,11 @@ def _container_path_covered(container_path: str, occupied: set[str]) -> bool:
     return any(container_path.startswith(f"{dest}/") for dest in occupied if dest)
 
 
+def _format_cpus(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 class DockerRuntimeError(RuntimeError):
     pass
 
@@ -235,10 +240,7 @@ class DockerProjectRuntime:
                     "--add-host",
                     "gateway.docker.internal:127.0.0.1",
         ]
-        if crypto:
-            command.extend(["--init", "--memory", f"{DEFAULT_MEMORY_MB}m",
-                            "--memory-swap", f"{DEFAULT_MEMORY_MB}m",
-                            "--pids-limit", str(CRYPTO_PIDS_LIMIT), "--cpus", "2"])
+        command.extend(self._resource_arguments(crypto=crypto))
         for host_path, container_path, read_only in mounts:
             mode = "ro" if read_only else "rw"
             command.extend(["-v", f"{host_path}:{container_path}:{mode}"])
@@ -297,9 +299,11 @@ class DockerProjectRuntime:
         state: str | None,
         log: DockerLogCallback | None,
     ) -> bool:
-        if state in {None, "running"} or not self._clash_environment_changed(container):
+        if state in {None, "running"}:
             return False
-        self._log(log, "docker container recreate started for clash settings", docker=container)
+        if not self._clash_environment_changed(container) and not self._container_limits_changed(project, container):
+            return False
+        self._log(log, "docker container recreate started for container settings", docker=container)
         self.remove_project_container(project, log=log)
         return True
 
@@ -325,6 +329,63 @@ class DockerProjectRuntime:
         if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
             return None
         return parsed
+
+    def _resource_arguments(self, *, crypto: bool) -> list[str]:
+        if crypto:
+            return [
+                "--init",
+                "--memory",
+                f"{DEFAULT_MEMORY_MB}m",
+                "--memory-swap",
+                f"{DEFAULT_MEMORY_MB}m",
+                "--pids-limit",
+                str(CRYPTO_PIDS_LIMIT),
+                "--cpus",
+                "2",
+            ]
+        memory_mb, cpus = self._container_limit_settings()
+        arguments: list[str] = []
+        if memory_mb > 0:
+            arguments.extend(["--memory", f"{memory_mb}m", "--memory-swap", f"{memory_mb}m"])
+        if cpus > 0:
+            arguments.extend(["--cpus", _format_cpus(cpus)])
+        return arguments
+
+    def _container_limit_settings(self) -> tuple[int, float]:
+        try:
+            settings = DispatcherSettings.from_env()
+        except Exception:
+            return 0, 0.0
+        return max(0, int(settings.container_memory_mb)), max(0.0, float(settings.container_cpus))
+
+    def _container_limits_changed(self, project: Project, container: str) -> bool:
+        if project.task_type == "crypto":
+            return False
+        actual = self._container_limits(container)
+        if actual is None:
+            return False
+        memory_mb, cpus = self._container_limit_settings()
+        desired_memory = memory_mb * 1024 * 1024
+        desired_nano = int(round(cpus * 1_000_000_000))
+        actual_memory, actual_nano = actual
+        return actual_memory != desired_memory or abs(actual_nano - desired_nano) > 1_000_000
+
+    def _container_limits(self, container: str) -> tuple[int, int] | None:
+        completed = subprocess.run(
+            ["docker", "inspect", "-f", "{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        parts = completed.stdout.split()
+        if len(parts) != 2:
+            return None
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
 
     def _container_state(self, container: str) -> str | None:
         completed = subprocess.run(
