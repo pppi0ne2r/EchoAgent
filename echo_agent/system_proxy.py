@@ -57,6 +57,8 @@ _LOOPBACK_HEX = {
     "0100007f",
     "00000000000000000000000001000000",
 }
+# 代理可能先尝试连接探测目标，失败后才返回 502。0.4 秒会把这种响应判成超时。
+_PROXY_PROBE_TIMEOUT = 2.0
 
 
 def system_proxy_settings() -> dict[str, object]:
@@ -304,8 +306,8 @@ def _identity_is_proxy(command: str, arguments: str) -> bool:
 
 def _looks_like_http_proxy(port: int) -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.4) as sock:
-            sock.settimeout(0.4)
+        with socket.create_connection(("127.0.0.1", port), timeout=_PROXY_PROBE_TIMEOUT) as sock:
+            sock.settimeout(_PROXY_PROBE_TIMEOUT)
             sock.sendall(
                 b"GET http://127.0.0.1:1/ HTTP/1.1\r\n"
                 b"Host: 127.0.0.1:1\r\n"
@@ -319,8 +321,8 @@ def _looks_like_http_proxy(port: int) -> bool:
 
 def _looks_like_socks_proxy(port: int) -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.4) as sock:
-            sock.settimeout(0.4)
+        with socket.create_connection(("127.0.0.1", port), timeout=_PROXY_PROBE_TIMEOUT) as sock:
+            sock.settimeout(_PROXY_PROBE_TIMEOUT)
             sock.sendall(b"\x05\x01\x00")
             data = sock.recv(2)
     except OSError:

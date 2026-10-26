@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import socket
 import subprocess
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +13,7 @@ from echo_agent.dispatcher.types import DispatchMode
 from echo_agent.server.docker_runtime import DockerProjectRuntime
 from echo_agent.system_proxy import (
     _identity_is_proxy,
+    _looks_like_http_proxy,
     _loopback_ports_in_proc,
     configured_proxy_environment,
     container_proxy_environment,
@@ -179,6 +183,27 @@ class SystemProxyTests(unittest.TestCase):
     def test_proxy_process_identity_ignores_unrelated_listeners(self) -> None:
         self.assertTrue(_identity_is_proxy("mihomo", "/usr/bin/mihomo -d /tmp"))
         self.assertFalse(_identity_is_proxy("sshd", "/usr/sbin/sshd"))
+
+    def test_http_probe_waits_for_slow_proxy_error(self) -> None:
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def respond() -> None:
+            connection, _address = server.accept()
+            with connection:
+                time.sleep(0.5)
+                connection.recv(1024)
+                connection.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+
+        thread = threading.Thread(target=respond)
+        thread.start()
+        try:
+            self.assertTrue(_looks_like_http_proxy(port))
+        finally:
+            thread.join(timeout=3)
+            server.close()
 
     def test_linux_environment_proxy_is_used_when_gnome_has_none(self) -> None:
         completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")
