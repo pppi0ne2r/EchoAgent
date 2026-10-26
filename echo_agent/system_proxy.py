@@ -1,14 +1,18 @@
 """把系统代理转成容器里可用的环境变量。
 
-macOS 从系统代理接口读取；Linux 从 GNOME 的手动代理配置读取。
-VPN 客户端开启系统代理后，宿主机的 urllib 会直接读取它。
-容器里的 127.0.0.1 不是宿主机，所以回环地址要改写到 echo-agent-host。
+macOS 从系统代理接口读取。Linux 先读 GNOME 手动代理，没有时再读
+http_proxy、https_proxy 和 all_proxy。容器里的 127.0.0.1 不是宿主机，
+所以回环地址要改写到 echo-agent-host。Linux 上只监听回环的代理，
+会在 Docker 网桥地址上补一个转发，容器才能连到宿主机。
 """
 
 from __future__ import annotations
 
+import os
+import socket
 import subprocess
 import sys
+import threading
 from typing import Mapping
 from urllib.parse import urlsplit, urlunsplit
 
@@ -26,6 +30,13 @@ _GNOME_PROXY_KEYS = (
 
 
 def system_proxy_settings() -> dict[str, object]:
+    native = _native_proxy_settings()
+    if _settings_have_proxy(native):
+        return native
+    return _environment_proxy_settings()
+
+
+def _native_proxy_settings() -> dict[str, object]:
     if "_scproxy" not in sys.modules:
         try:
             import _scproxy
@@ -39,6 +50,42 @@ def system_proxy_settings() -> dict[str, object]:
     except Exception:
         return {}
     return settings if isinstance(settings, dict) else {}
+
+
+def _settings_have_proxy(settings: Mapping[str, object]) -> bool:
+    return any(_enabled_proxy(settings, name) for name in ("HTTP", "HTTPS", "SOCKS"))
+
+
+def _environment_proxy_settings() -> dict[str, object]:
+    settings: dict[str, object] = {}
+    http = _parse_proxy_endpoint(os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY") or "")
+    https = _parse_proxy_endpoint(os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or "")
+    socks_raw = os.environ.get("all_proxy") or os.environ.get("ALL_PROXY") or ""
+    socks = _parse_proxy_endpoint(socks_raw)
+    if http is not None:
+        host, port = http
+        settings.update(HTTPEnable=1, HTTPProxy=host, HTTPPort=port)
+    if https is not None:
+        host, port = https
+        settings.update(HTTPSEnable=1, HTTPSProxy=host, HTTPSPort=port)
+    if socks is not None and socks_raw.lower().startswith("socks"):
+        host, port = socks
+        settings.update(SOCKSEnable=1, SOCKSProxy=host, SOCKSPort=port)
+    return settings
+
+
+def _parse_proxy_endpoint(value: str) -> tuple[str, int] | None:
+    text = value.strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = f"http://{text}"
+    parts = urlsplit(text)
+    host = parts.hostname or ""
+    port = parts.port
+    if not host or port is None or not 1 <= port <= 65535:
+        return None
+    return host, port
 
 
 def _gnome_proxy_settings() -> dict[str, object]:
@@ -103,7 +150,10 @@ def system_proxy_enabled() -> bool:
 def configured_proxy_environment() -> dict[str, str]:
     if not system_proxy_enabled():
         return {}
-    return container_proxy_environment(system_proxy_settings())
+    environment = container_proxy_environment(system_proxy_settings())
+    if environment:
+        ensure_container_proxy_reachable(environment)
+    return environment
 
 
 def container_proxy_environment(settings: Mapping[str, object] | None = None) -> dict[str, str]:
@@ -144,9 +194,11 @@ def proxy_clear_arguments() -> list[str]:
 
 
 def proxy_exec_arguments() -> list[str]:
+    if not system_proxy_enabled():
+        return proxy_clear_arguments()
     environment = configured_proxy_environment()
     if not environment:
-        return proxy_clear_arguments()
+        return []
     return proxy_environment_arguments(environment)
 
 
@@ -241,6 +293,113 @@ def proxy_build_arguments(environment: Mapping[str, str]) -> list[str]:
     if not arguments:
         return []
     return ["--add-host", f"{CONTAINER_PROXY_HOST}:host-gateway", *arguments]
+
+
+_forwarded_ports: set[int] = set()
+_forwarder_lock = threading.Lock()
+
+
+def ensure_container_proxy_reachable(environment: Mapping[str, str]) -> None:
+    """Linux 上把只监听 127.0.0.1 的代理转到 Docker 网桥地址。"""
+    for port in _container_proxy_ports(environment):
+        _ensure_forwarder(port)
+
+
+def _container_proxy_ports(environment: Mapping[str, str]) -> set[int]:
+    ports: set[int] = set()
+    for key in ("http_proxy", "https_proxy", "all_proxy"):
+        parts = urlsplit(environment.get(key) or "")
+        if parts.hostname == CONTAINER_PROXY_HOST and parts.port:
+            ports.add(parts.port)
+    return ports
+
+
+def _ensure_forwarder(port: int) -> None:
+    with _forwarder_lock:
+        if port in _forwarded_ports:
+            return
+        gateway = _docker_bridge_gateway()
+        if not gateway or _tcp_open(gateway, port) or not _tcp_open("127.0.0.1", port):
+            return
+        try:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((gateway, port))
+            listener.listen(32)
+        except OSError:
+            return
+        _forwarded_ports.add(port)
+        threading.Thread(
+            target=_accept_proxy_forward,
+            args=(listener, port),
+            daemon=True,
+            name=f"echo-agent-proxy-{port}",
+        ).start()
+
+
+def _docker_bridge_gateway() -> str:
+    try:
+        completed = subprocess.run(
+            ["docker", "network", "inspect", "bridge", "-f", "{{(index .IPAM.Config 0).Gateway}}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    gateway = completed.stdout.strip()
+    if not gateway or gateway == "<no value>":
+        return ""
+    return gateway
+
+
+def _tcp_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _accept_proxy_forward(listener: socket.socket, port: int) -> None:
+    try:
+        while True:
+            client, _address = listener.accept()
+            threading.Thread(target=_bridge_proxy, args=(client, port), daemon=True).start()
+    except OSError:
+        return
+
+
+def _bridge_proxy(client: socket.socket, port: int) -> None:
+    try:
+        remote = socket.create_connection(("127.0.0.1", port), timeout=10)
+    except OSError:
+        client.close()
+        return
+    left = threading.Thread(target=_pipe_proxy, args=(client, remote), daemon=True)
+    right = threading.Thread(target=_pipe_proxy, args=(remote, client), daemon=True)
+    left.start()
+    right.start()
+
+
+def _pipe_proxy(source: socket.socket, destination: socket.socket) -> None:
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            destination.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for sock in (source, destination):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 def _enabled_proxy(settings: Mapping[str, object], name: str, scheme: str = "http") -> str | None:

@@ -107,8 +107,59 @@ class SystemProxyTests(unittest.TestCase):
         with (
             patch.dict("sys.modules", {"_scproxy": None}),
             patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+            patch.dict("os.environ", {}, clear=True),
         ):
             self.assertEqual(system_proxy_settings(), {})
+
+    def test_linux_environment_proxy_is_used_when_gnome_has_none(self) -> None:
+        completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")
+        with (
+            patch.dict("sys.modules", {"_scproxy": None}),
+            patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+            patch.dict(
+                "os.environ",
+                {"https_proxy": "http://127.0.0.1:7890", "all_proxy": "socks5://127.0.0.1:7891"},
+                clear=True,
+            ),
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=True),
+            patch("echo_agent.system_proxy.ensure_container_proxy_reachable"),
+        ):
+            environment = configured_proxy_environment()
+        self.assertEqual(environment["https_proxy"], "http://echo-agent-host:7890")
+        self.assertNotIn("all_proxy", environment)
+
+    def test_enabled_without_proxy_does_not_clear_container_environment(self) -> None:
+        with (
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=True),
+            patch("echo_agent.system_proxy.system_proxy_settings", return_value={}),
+        ):
+            self.assertEqual(proxy_exec_arguments(), [])
+
+    def test_loopback_proxy_is_forwarded_on_the_docker_bridge(self) -> None:
+        from echo_agent.system_proxy import _forwarded_ports, ensure_container_proxy_reachable
+
+        binds: list[tuple[str, int]] = []
+
+        class Listener:
+            def setsockopt(self, *_args: object) -> None:
+                return None
+
+            def bind(self, address: tuple[str, int]) -> None:
+                binds.append(address)
+
+            def listen(self, _backlog: int) -> None:
+                return None
+
+        _forwarded_ports.clear()
+        with (
+            patch("echo_agent.system_proxy._docker_bridge_gateway", return_value="172.17.0.1"),
+            patch("echo_agent.system_proxy._tcp_open", side_effect=lambda host, _port: host == "127.0.0.1"),
+            patch("echo_agent.system_proxy.socket.socket", return_value=Listener()),
+            patch("echo_agent.system_proxy.threading.Thread"),
+        ):
+            ensure_container_proxy_reachable({"https_proxy": "http://echo-agent-host:7890"})
+        _forwarded_ports.clear()
+        self.assertEqual(binds, [("172.17.0.1", 7890)])
 
     def test_proxy_signature_ignores_unrelated_container_environment(self) -> None:
         environment = container_proxy_environment(HTTP_SETTINGS)
