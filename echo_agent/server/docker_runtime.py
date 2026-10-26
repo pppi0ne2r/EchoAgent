@@ -17,13 +17,6 @@ from echo_agent.crypto_files import CryptoProjectFiles
 from echo_agent.crypto_budget import CRYPTO_PIDS_LIMIT, DEFAULT_MEMORY_MB
 from echo_agent.models import Project, ProjectStatus
 from echo_agent.server.extensions import ExtensionCatalog, ExtensionResolveError, extension_resource
-from echo_agent.system_proxy import (
-    configured_proxy_environment,
-    container_proxy_signature,
-    proxy_build_arguments,
-    proxy_docker_arguments,
-    proxy_signature,
-)
 from echo_agent.server.attachments import CONTAINER_ATTACHMENT_DIR
 from echo_agent.server.project_workspace import CONTAINER_WORK_DIR, ProjectWorkspace
 
@@ -116,10 +109,6 @@ class DockerProjectRuntime:
         self._log(log, "docker container inspect started", docker=container)
         state = self._container_state(container)
         self._log(log, "docker container inspect finished", docker=container, state=state or "missing")
-        if state is not None and self._proxy_configuration_changed(container):
-            self._log(log, "docker container recreate started for proxy configuration", docker=container)
-            self.remove_project_container(project, log=log)
-            state = None
         if state is None:
             self._log(log, "docker container create/start started", docker=container, image=self.image)
             self._run(
@@ -135,12 +124,6 @@ class DockerProjectRuntime:
             self._log(log, "docker container start finished", docker=container)
             return
         self._log(log, "docker container already running", docker=container)
-
-    def _proxy_configuration_changed(self, container: str) -> bool:
-        actual = container_proxy_signature(container)
-        if actual is None:
-            return False
-        return actual != proxy_signature()
 
     def prepare_extensions(self, log: DockerLogCallback | None = None) -> list[dict[str, str]]:
         return self._prepare_extension_items(log=log)
@@ -251,7 +234,6 @@ class DockerProjectRuntime:
                     "--add-host",
                     "gateway.docker.internal:127.0.0.1",
         ]
-        command.extend(proxy_docker_arguments(configured_proxy_environment()))
         if crypto:
             command.extend(["--init", "--memory", f"{DEFAULT_MEMORY_MB}m",
                             "--memory-swap", f"{DEFAULT_MEMORY_MB}m",
@@ -270,11 +252,6 @@ class DockerProjectRuntime:
             self.ensure_project_container(project, log=log)
             return
         if state != "running":
-            if self._proxy_configuration_changed(container):
-                self._log(log, "docker container recreate started for proxy configuration", docker=container)
-                self.remove_project_container(project, log=log)
-                self.ensure_project_container(project, log=log)
-                return
             self._log(log, "docker container start started", docker=container, previous_state=state)
             self._run(["docker", "start", container], log=log, output_prefix="docker start")
             self._log(log, "docker container start finished", docker=container)
@@ -390,7 +367,6 @@ class DockerProjectRuntime:
         command = ["docker", "build"]
         if self.build_network:
             command.extend(["--network", self.build_network])
-        command.extend(proxy_build_arguments(configured_proxy_environment()))
         command.extend(["-t", self.image, "-f", str(self.dockerfile), str(self.context)])
         return command
 

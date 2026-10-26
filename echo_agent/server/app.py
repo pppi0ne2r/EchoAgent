@@ -871,7 +871,6 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
                 model=data.model,
                 api_key=data.api_key,
                 clear_api_key=data.clear_api_key,
-                use_system_proxy=data.use_system_proxy,
             )
             app.state.dispatcher_runner._promote()
             return saved

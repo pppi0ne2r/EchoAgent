@@ -78,9 +78,6 @@ image = "echo-agent-worker"
 context = "container"
 dockerfile = "container/Dockerfile"
 build_network = "host"
-# 为 true 时，容器、镜像构建和 Codex 使用系统代理。macOS 读取系统代理，Linux 读取 GNOME 手动代理。也可在配置页修改。
-use_system_proxy = false
-
 [resources]
 # Host directory for the extension catalog. Tools, knowledge bases, and skills
 # are configured in the web UI, not as a second resource list.
