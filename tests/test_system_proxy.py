@@ -132,6 +132,23 @@ class SystemProxyTests(unittest.TestCase):
         self.assertNotIn("all_proxy", environment)
         forward.assert_called_once()
 
+    def test_hidden_listener_still_uses_known_loopback_port(self) -> None:
+        completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")
+        with (
+            patch.dict("sys.modules", {"_scproxy": None}),
+            patch("echo_agent.system_proxy.subprocess.run", return_value=completed),
+            patch.dict("os.environ", {}, clear=True),
+            patch("echo_agent.system_proxy._loopback_listen_ports", return_value=set()),
+            patch("echo_agent.system_proxy._proxy_process_listen_ports", return_value=set()),
+            patch("echo_agent.system_proxy._looks_like_http_proxy", side_effect=lambda port: port == 7892),
+            patch("echo_agent.system_proxy.system_proxy_enabled", return_value=True),
+            patch("echo_agent.system_proxy.ensure_container_proxy_reachable") as forward,
+        ):
+            environment = configured_proxy_environment()
+
+        self.assertEqual(environment["https_proxy"], "http://echo-agent-host:7892")
+        forward.assert_called_once()
+
     def test_linux_loopback_socks_listener_is_used_when_http_probe_fails(self) -> None:
         completed = subprocess.CompletedProcess(["gsettings"], 0, "'none'\n", "")
         with (

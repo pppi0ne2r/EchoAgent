@@ -1,8 +1,8 @@
 """把系统代理转成容器里可用的环境变量。
 
 macOS 从系统代理接口读取。Linux 先读 GNOME 手动代理，没有时再读
-http_proxy、https_proxy 和 all_proxy。这两处都没有时，再识别本机回环上
-已经在监听的 HTTP 或 SOCKS 代理。容器里的 127.0.0.1 不是宿主机，
+http_proxy、https_proxy 和 all_proxy。这两处都没有时，再探测本机回环上的常见代理端口。
+监听进程不可见时也会探测。容器里的 127.0.0.1 不是宿主机，
 所以回环地址要改写到 echo-agent-host。Linux 上只监听回环的代理，
 会在 Docker 网桥地址上补一个转发，容器才能连到宿主机。
 """
@@ -171,10 +171,11 @@ def _gsettings_port(raw: str) -> int | None:
 
 
 def _local_proxy_settings() -> dict[str, object]:
-    """GNOME 和进程环境都没有代理时，使用本机回环上实际在监听的代理。"""
+    """GNOME 和进程环境都没有代理时，直接探测本机回环上的常见代理端口。
+
+    监听进程可能属于其他用户，/proc 里看不到。探测不依赖进程权限。
+    """
     listening = _loopback_listen_ports()
-    if not listening:
-        return {}
     owned = _proxy_process_listen_ports()
     for port in _ordered_proxy_ports(owned, listening, _HTTP_PROXY_PORTS):
         if _looks_like_http_proxy(port):
@@ -202,7 +203,7 @@ def _ordered_proxy_ports(
     seen: set[int] = set()
 
     def add(port: int) -> None:
-        if port in seen or port not in listening:
+        if port in seen or not 1 <= port <= 65535:
             return
         seen.add(port)
         ordered.append(port)
@@ -212,6 +213,9 @@ def _ordered_proxy_ports(
             add(port)
     for port in sorted(owned):
         add(port)
+    for port in preferred:
+        if port in listening:
+            add(port)
     for port in preferred:
         add(port)
     return ordered
