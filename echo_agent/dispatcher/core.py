@@ -340,11 +340,15 @@ class Dispatcher:
         mode: DispatchMode,
         release_project: bool,
     ) -> DispatchResult:
+        intent_ids = [intent.id for intent in intents]
+        started_message = f"explore started with {len(intents)} active intents"
+        if intent_ids:
+            started_message = f"{started_message}: {'、'.join(f'#{intent_id}' for intent_id in intent_ids)}"
         self._log(
             project.id,
-            f"explore started with {len(intents)} active intents",
+            started_message,
             "info",
-            {"intent_ids": [intent.id for intent in intents], "codex_slots": self.max_codex_slots},
+            {"intent_ids": intent_ids, "codex_slots": self.max_codex_slots},
         )
 
         finished_count = 0
@@ -559,6 +563,7 @@ class Dispatcher:
                 ]
         planned_count = 0
         planned_intent_ids: list[int] = []
+        planned_intent_summaries: list[dict[str, object]] = []
         skipped_repeat = 0
         skipped_from = 0
         skipped_crypto = 0
@@ -649,6 +654,7 @@ class Dispatcher:
                     reject_crypto_plan(item, exc)
                     continue
                 planned_intent_ids.append(intent.id)
+                planned_intent_summaries.append({"id": intent.id, "description": description[:160]})
                 planned_count += 1
         if crypto_rejections:
             project.crypto["planning_feedback"] = {
@@ -705,12 +711,18 @@ class Dispatcher:
             self._no_progress_reasons = 0
             self._reason_salvage_failures = 0
         self._persist_step(project, release_project=release_project)
+        planned_message = f"reason planned {planned_count} new intents"
+        if planned_intent_ids:
+            planned_message = (
+                f"{planned_message}: {'、'.join(f'#{intent_id}' for intent_id in planned_intent_ids)}"
+            )
         self._log(
             project.id,
-            f"reason planned {planned_count} new intents",
+            planned_message,
             "info",
             {
                 "intent_ids": planned_intent_ids,
+                "intent_summaries": planned_intent_summaries,
                 "skipped_repeat": skipped_repeat,
                 "skipped_unplannable_from": skipped_from,
             },
@@ -1017,6 +1029,13 @@ class Dispatcher:
             with self._state_lock:
                 intent.mark_running()
                 self.client.save_project(project)
+            if mode == DispatchMode.EXPLORE:
+                self._log(
+                    project.id,
+                    f"explore intent {intent.id} started",
+                    "info",
+                    {"intent_id": intent.id},
+                )
             return self._execute_with_retry(project, intent, mode, scope)
         finally:
             self._model_slots.release()

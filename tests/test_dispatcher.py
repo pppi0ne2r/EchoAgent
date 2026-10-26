@@ -285,6 +285,11 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         self.assertTrue(all(intent.to_fact_id is None for intent in branch_intents))
         planned = next(log for log in client.logs if str(log["message"]).startswith("reason planned"))
         self.assertEqual(planned["metadata"]["intent_ids"], [intent.id for intent in branch_intents])
+        self.assertIn("#" + str(branch_intents[0].id), planned["message"])
+        self.assertEqual(
+            [item["description"] for item in planned["metadata"]["intent_summaries"]],
+            [intent.description for intent in branch_intents],
+        )
 
     def test_reason_creates_next_intents_after_first_run_fact(self) -> None:
         project = Project(
@@ -1677,8 +1682,11 @@ class OuterLoopFixTests(unittest.TestCase):
         dispatcher.run_once(project.id, release_project=False)
 
         started = next(log for log in client.logs if log["message"].startswith("explore started"))
+        running = next(log for log in client.logs if log["message"] == "explore intent 0 started")
         finished = next(log for log in client.logs if log["message"] == "explore intent 0 finished")
         self.assertEqual(started["metadata"]["intent_ids"], [0])
+        self.assertIn("#0", started["message"])
+        self.assertEqual(running["metadata"]["intent_id"], 0)
         self.assertEqual(finished["metadata"]["fact_ids"], [2, 3])
 
     def test_first_run_log_records_created_fact_ids(self) -> None:
