@@ -1568,7 +1568,7 @@ const GRAPH = {
   marginX: 108,
   marginY: 72,
   factColumnGap: 380,
-  intentColumnGap: 220,
+  intentColumnGap: 380,
   rowGap: 112,
   minWidth: 640,
   minHeight: 420,
@@ -1583,12 +1583,32 @@ function layoutGraph(facts, intents) {
   });
   const factPositions = layoutFactsLeftToRight(columns, intents);
   const intentPositions = layoutOpenIntents(intents, factPositions, factDepthById, columns.length);
+  parkDisconnectedGoal(facts, intents, factPositions, intentPositions);
   const points = [...factPositions.values(), ...intentPositions.values()];
   const maxX = points.reduce((max, point) => Math.max(max, point.x), GRAPH.marginX);
   const maxY = points.reduce((max, point) => Math.max(max, point.y), GRAPH.marginY);
   const width = Math.max(GRAPH.minWidth, maxX + GRAPH.marginX + 24);
   const height = Math.max(GRAPH.minHeight, maxY + GRAPH.marginY);
   return { width, height, factPositions, intentPositions };
+}
+
+
+function parkDisconnectedGoal(facts, intents, factPositions, intentPositions) {
+  const goal = facts.find((fact) => Number(fact.id) === 1 || fact.kind === "goal");
+  if (!goal) return;
+  const goalId = Number(goal.id);
+  if (intents.some((intent) => intentTargets(intent).includes(goalId))) return;
+  const current = factPositions.get(goal.id) || factPositions.get(goalId);
+  if (!current) return;
+  const otherXs = [...factPositions.entries()]
+    .filter(([id]) => Number(id) !== goalId)
+    .map(([, point]) => point.x);
+  const intentXs = [...intentPositions.values()].map((point) => point.x);
+  const sharesColumn = otherXs.some((x) => Math.abs(x - current.x) < 1);
+  const blockedOnRight = intentXs.some((x) => x > current.x - 92);
+  if (!sharesColumn && !blockedOnRight) return;
+  const rightmost = Math.max(current.x, ...otherXs, ...intentXs);
+  factPositions.set(goal.id, { x: rightmost + GRAPH.factColumnGap, y: GRAPH.marginY });
 }
 
 function groupOpenIntents(intents) {
