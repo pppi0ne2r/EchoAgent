@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from echo_agent.dispatcher.agents import answer_source_context
+from echo_agent.dispatcher.objectives import required_finding_count
 from echo_agent.dispatcher.parsing import (
     ReasonFormatError,
     extract_mode_json_output,
@@ -64,6 +65,20 @@ class DispatcherParsingTests(unittest.TestCase):
 
         self.assertIsNone(result.answer)
         self.assertIsNone(result.fact_description)
+
+    def test_reason_output_keeps_accepted_fact_ids(self) -> None:
+        result = parse_reason_result(
+            '{"completed": true, "answer": "已确认3个漏洞", "accepted_fact_ids": [6, 6, 13], "next_intents": []}'
+        )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.accepted_fact_ids, (6, 13))
+
+    def test_reason_output_rejects_non_integer_fact_ids(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_reason_result(
+                '{"completed": true, "answer": "已确认3个漏洞", "accepted_fact_ids": ["6"], "next_intents": []}'
+            )
 
     def test_reason_output_accepts_structured_intents(self) -> None:
         result = parse_reason_result(
@@ -339,3 +354,12 @@ class DispatcherParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FindingObjectiveTests(unittest.TestCase):
+    def test_only_vulnerability_objectives_require_multiple_facts(self) -> None:
+        self.assertEqual(required_finding_count("寻找至少3个漏洞。"), 3)
+        self.assertEqual(required_finding_count("find at least 2 vulnerabilities"), 2)
+        self.assertEqual(required_finding_count("get flag"), 1)
+        self.assertEqual(required_finding_count("寻找漏洞"), 1)
+        self.assertEqual(required_finding_count("至少3次重试"), 1)

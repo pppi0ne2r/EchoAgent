@@ -26,6 +26,7 @@ from echo_agent.dispatcher.agents import (
     fatal_upstream_marker,
 )
 from echo_agent.dispatcher.client import ProjectClient
+from echo_agent.dispatcher.objectives import required_finding_count
 from echo_agent.dispatcher.parsing import (
     ReasonFormatError,
     _optional_fact_description,
@@ -456,6 +457,7 @@ class Dispatcher:
         self._reason_failures = 0
         self._reason_format_failures = 0
         completion_rejected = False
+        finding_completion_rejected = False
         if result.completed:
             if any(intent.status == IntentStatus.RUNNING for intent in project.intents.values()):
                 recovered = self._recover_stranded_intents(project)
@@ -489,7 +491,50 @@ class Dispatcher:
                 self._log(project.id, messages[source], "success")
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status,
                                       f"crypto answer completed by {source}")
-            if project.task_type != "crypto" and result.answer and self._answer_provenance(project, result.answer) == "verified":
+            if project.task_type != "crypto" and required_finding_count(project.objective) > 1:
+                required = required_finding_count(project.objective)
+                accepted, rejection = self._accepted_finding_facts(
+                    project,
+                    result.accepted_fact_ids,
+                    required,
+                )
+                if accepted is not None:
+                    self._set_finding_result(project, result.answer, accepted)
+                    for fact in accepted:
+                        self._connect_fact_to_goal(project, fact.id)
+                    self._complete_project(project)
+                    self._no_progress_reasons = 0
+                    self._persist_step(project, release_project=release_project)
+                    self._log(
+                        project.id,
+                        "reason marked project completed from accepted findings",
+                        "success",
+                        {
+                            "has_answer": bool(result.answer),
+                            "answer": result.answer,
+                            "accepted_fact_ids": [fact.id for fact in accepted],
+                        },
+                    )
+                    return DispatchResult(
+                        project.id,
+                        DispatchMode.COMPLETED,
+                        project.status,
+                        "reason marked project completed",
+                    )
+                self._log(
+                    project.id,
+                    "reason completion rejected because accepted findings are incomplete",
+                    "warning",
+                    {
+                        "required": required,
+                        "accepted_fact_ids": list(result.accepted_fact_ids),
+                        "reason": rejection,
+                    },
+                )
+                self._record_rejected_findings(project, required, result.accepted_fact_ids, rejection)
+                completion_rejected = True
+                finding_completion_rejected = True
+            elif project.task_type != "crypto" and result.answer and self._answer_provenance(project, result.answer) == "verified":
                 self._set_end_fact_result(project, result.answer)
                 self._connect_answer_fact_to_goal(project, result.answer)
                 self._complete_project(project)
@@ -502,15 +547,16 @@ class Dispatcher:
                     {"has_answer": True, "answer": result.answer},
                 )
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
-            self._log(
-                project.id,
-                "reason completion rejected: no current passing crypto verification" if project.task_type == "crypto" else "reason completion rejected because the answer is not in evidence",
-                "warning",
-                {"has_answer": bool(result.answer)},
-            )
-            completion_rejected = True
-            if project.task_type != "crypto":
-                self._record_rejected_answer(project, result.answer)
+            else:
+                self._log(
+                    project.id,
+                    "reason completion rejected: no current passing crypto verification" if project.task_type == "crypto" else "reason completion rejected because the answer is not in evidence",
+                    "warning",
+                    {"has_answer": bool(result.answer)},
+                )
+                completion_rejected = True
+                if project.task_type != "crypto":
+                    self._record_rejected_answer(project, result.answer)
 
         planned_intents = self._planned_intents_from_reason_result(project, result)
         if project.task_type == "crypto":
@@ -531,7 +577,7 @@ class Dispatcher:
                     metadata["input_ids"] = candidate.crypto.get("source_input_ids", [])
                     metadata["input_fact_ids"] = [candidate.id]
                     metadata.setdefault("scope", {"input_ids": metadata["input_ids"]})
-        if completion_rejected and not planned_intents and result.answer:
+        if completion_rejected and not finding_completion_rejected and not planned_intents and result.answer:
             # 模型声称完成但缺少证据、又没规划下一步：自动生成一条针对性验证，
             # 避免运行停在原地（BUG-016）。action_key 带答案哈希，避免不同候选
             # 被同一条 intent 去重掉（BUG-018）。
@@ -1868,11 +1914,94 @@ class Dispatcher:
             text = f"{text}\nsource: {result.answer_source}"
         return text
 
+    _GOAL_EDGE_DESCRIPTION = "得到最终结果"
+
     @staticmethod
     def _set_end_fact_result(project: Project, answer: str) -> None:
         if 1 not in project.facts:
             return
         project.facts[1].description = f"result\nanswer: {answer}"
+
+    @staticmethod
+    def _set_finding_result(project: Project, answer: str | None, facts: list[object]) -> None:
+        if 1 not in project.facts:
+            return
+        labels = "、".join(f"F{fact.id}" for fact in facts)
+        summary = str(answer or "").strip() or f"已确认 {len(facts)} 个漏洞"
+        project.facts[1].description = f"accepted_facts: {labels}\nanswer: {summary}"
+
+    @staticmethod
+    def _accepted_finding_facts(
+        project: Project,
+        fact_ids: tuple[int, ...] | list[int],
+        required: int,
+    ) -> tuple[list[object] | None, str]:
+        submitted = list(fact_ids or ())
+        if not submitted:
+            return None, "未提交 accepted_fact_ids"
+        accepted: list[object] = []
+        problems: list[str] = []
+        seen: set[int] = set()
+        for fact_id in submitted:
+            if fact_id in seen:
+                continue
+            seen.add(fact_id)
+            fact = project.facts.get(fact_id)
+            if fact is None:
+                problems.append(f"F{fact_id} 不存在")
+                continue
+            if fact.id in {0, 1} or fact.kind != FactKind.EVIDENCE:
+                problems.append(f"F{fact_id} 不是 evidence")
+                continue
+            description = fact.description or ""
+            if description.startswith(PARTIAL_OUTPUT_PREFIX):
+                problems.append(f"F{fact_id} 是未完成摘录")
+                continue
+            if description.startswith(ANSWER_WRAPPER_PREFIX):
+                problems.append(f"F{fact_id} 是候选答案包装")
+                continue
+            accepted.append(fact)
+        if problems or len(accepted) < required:
+            detail = f"有效 evidence 只有 {len(accepted)} 条，需要至少 {required} 条"
+            if problems:
+                detail += "；" + "；".join(problems)
+            return None, detail
+        return accepted, ""
+
+    @staticmethod
+    def _record_rejected_findings(
+        project: Project,
+        required: int,
+        fact_ids: tuple[int, ...] | list[int],
+        reason: str,
+    ) -> None:
+        marker = (
+            f"完成被拒绝：目的要求至少 {required} 个 evidence 漏洞事实，"
+            f"accepted_fact_ids={list(fact_ids or ())} 未通过：{reason}。"
+            "单条事实中的“第N个漏洞”不能代替这些 id。"
+        )
+        if any(fact.description == marker for fact in project.facts.values()):
+            return
+        project.add_fact(marker, kind=FactKind.REFUTED)
+
+    @staticmethod
+    def _connect_fact_to_goal(project: Project, fact_id: int) -> None:
+        if 1 not in project.facts or fact_id in {0, 1} or fact_id not in project.facts:
+            return
+        if any(
+            intent.from_fact_id == fact_id
+            and intent.description == Dispatcher._GOAL_EDGE_DESCRIPTION
+            and 1 in intent.to_fact_ids
+            for intent in project.intents.values()
+        ):
+            return
+        intent = project.add_intent(
+            description=Dispatcher._GOAL_EDGE_DESCRIPTION,
+            from_fact_id=fact_id,
+            to_fact_id=1,
+        )
+        intent.mark_running()
+        intent.mark_completed()
 
     @staticmethod
     def _connect_answer_fact_to_goal(project: Project, answer: str) -> None:
@@ -1891,26 +2020,7 @@ class Dispatcher:
         )
         if source_fact is None:
             return
-        producers = [
-            intent
-            for intent in project.intents.values()
-            if source_fact.id in intent.to_fact_ids and not Dispatcher._is_initial_probe_intent(intent)
-        ]
-        if producers:
-            max(producers, key=lambda item: item.id).add_target(1)
-            return
-        if any(
-            intent.from_fact_id == source_fact.id and 1 in intent.to_fact_ids
-            for intent in project.intents.values()
-        ):
-            return
-        intent = project.add_intent(
-            description="得到最终结果",
-            from_fact_id=source_fact.id,
-            to_fact_id=1,
-        )
-        intent.mark_running()
-        intent.mark_completed()
+        Dispatcher._connect_fact_to_goal(project, source_fact.id)
 
     @staticmethod
     def _dispatch_mode(project: Project) -> DispatchMode:

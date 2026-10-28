@@ -765,6 +765,44 @@ function intentTargets(intent) {
   return targets;
 }
 
+const COMPLETION_EDGE_DESCRIPTIONS = new Set([
+  "得到最终结果",
+  "候选答案通过原始输入独立校验",
+  "候选答案获得平台回执",
+  "证据事实包含最终答案",
+]);
+
+function isCompletionIntent(intent) {
+  return COMPLETION_EDGE_DESCRIPTIONS.has(String(intent?.description || ""));
+}
+
+function acceptedFactLabels(description) {
+  const match = String(description || "").match(/accepted_facts:\s*([^\n]+)/);
+  if (!match) return [];
+  return [...match[1].matchAll(/F?\d+/g)].map((item) => {
+    const raw = item[0];
+    return raw.startsWith("F") ? raw : `F${raw}`;
+  });
+}
+
+function goalNodeText(description) {
+  const labels = acceptedFactLabels(description);
+  return labels.length ? `依据 ${labels.join("、")}` : description;
+}
+
+function goalAcceptedLabels(project) {
+  const goal = (project?.facts || []).find((fact) => Number(fact.id) === 1);
+  const fromDescription = acceptedFactLabels(goal?.description);
+  if (fromDescription.length) return fromDescription;
+  const labels = [];
+  for (const intent of project?.intents || []) {
+    if (!isCompletionIntent(intent) || !intentTargets(intent).includes(1) || intent.from == null) continue;
+    const label = `F${intent.from}`;
+    if (!labels.includes(label)) labels.push(label);
+  }
+  return labels;
+}
+
 function graphEdges(intents) {
   const edges = [];
   for (const intent of intents) {
@@ -987,11 +1025,15 @@ function scheduleRows(phase) {
   } else if (phase.kind === "reason") {
     if (phase.result.startsWith("项目完成")) {
       const basis = answerBasisFactId(phase.answer);
+      const accepted = acceptedFactLabels(factById(1)?.description);
+      const basisText = accepted.length
+        ? `，依据 ${accepted.join("、")}`
+        : (basis === null ? "" : `，依据 F${basis}`);
       rows.push({
         id: `${phase.id}-result`,
         role: "child",
         level: "success",
-        text: basis === null ? phase.result : `${phase.result}，依据 F${basis}`,
+        text: `${phase.result}${basisText}`,
       });
     } else if (phase.done && phase.plannedIntents.length) {
       rows.push({
@@ -1426,13 +1468,17 @@ function drawGraph(project) {
     });
     edgeLayer.appendChild(line(edge.path, statusColor(intent.status), selected, onClick, intent));
     if (edge.showLabel !== false) {
-      edgeLayer.appendChild(label(edge.labelX, edge.labelY, `#${intent.id}`, selected, onClick, intent));
+      const edgeLabel = isCompletionIntent(intent) ? "达成" : `#${intent.id}`;
+      edgeLayer.appendChild(label(edge.labelX, edge.labelY, edgeLabel, selected, onClick, intent));
     }
   }
 
   for (const fact of facts) {
     const pos = factPositions.get(fact.id);
-    nodeLayer.appendChild(node(pos.x, pos.y, `F${fact.id}`, fact.description, fact.id === state.selectedFactId, () => {
+    const factText = Number(fact.id) === 1 && goalAcceptedLabels(project).length
+      ? `依据 ${goalAcceptedLabels(project).join("、")}`
+      : fact.description;
+    nodeLayer.appendChild(node(pos.x, pos.y, `F${fact.id}`, factText, fact.id === state.selectedFactId, () => {
       state.selectedFactId = fact.id;
       state.selectedIntentId = null;
       drawGraph(project);
@@ -1844,6 +1890,7 @@ function node(x, y, title, description, selected = false, onClick = null, kind =
   });
   group.appendChild(rect);
   group.appendChild(svgText(x - 76, y - 15, title, { class: "node-title" }));
+  const visibleDescription = kind === "goal" ? goalNodeText(description) : description;
   const clipId = `fact-text-${title}`;
   const clip = svgElement("clipPath", { id: clipId });
   clip.appendChild(svgElement("rect", {
@@ -1853,7 +1900,7 @@ function node(x, y, title, description, selected = false, onClick = null, kind =
     height: 42,
   }));
   group.appendChild(clip);
-  appendWrappedSvgText(group, x - 76, y + 8, description || "", 148, 2, 12, `url(#${clipId})`);
+  appendWrappedSvgText(group, x - 76, y + 8, visibleDescription || "", 148, 2, 12, `url(#${clipId})`);
   if (onClick) {
     group.addEventListener("click", onClick);
     group.addEventListener("keydown", (event) => {
@@ -2248,6 +2295,7 @@ function line(pathData, color, selected = false, onClick = null, intent = null) 
   path.setAttribute("stroke-linecap", "round");
   path.setAttribute("marker-end", `url(#arrow-${colorName(color)})`);
   const flowing = intent?.status === "running";
+  if (isCompletionIntent(intent)) path.classList.add("graph-edge-completion");
   if (flowing) path.classList.add("is-flowing");
   const hitPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
   hitPath.classList.add("graph-edge-hit");

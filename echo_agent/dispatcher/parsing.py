@@ -133,9 +133,26 @@ def parse_reason_result(output: str) -> ReasonResult:
         next_intent_descriptions=[str(item["description"]) for item in kept],
         next_intents=kept,
         answer=_optional_answer(data.get("answer")),
+        accepted_fact_ids=_parse_accepted_fact_ids(data.get("accepted_fact_ids")),
         stop_reason=_optional_reason_text(data.get("stop_reason"), "stop_reason"),
         raw_output=output,
     )
+
+
+def _parse_accepted_fact_ids(value: object) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("reason output accepted_fact_ids must be a list")
+    ids: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError("reason output accepted_fact_ids items must be integers")
+        if item < 0:
+            raise ValueError("reason output accepted_fact_ids items must be non-negative")
+        if item not in ids:
+            ids.append(item)
+    return tuple(ids)
 
 
 def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[str, object]:

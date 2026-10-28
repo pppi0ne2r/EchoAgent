@@ -146,6 +146,20 @@ class FixedAnswerReasoner:
         return ReasonResult(completed=True, answer=self.answer, next_intents=[])
 
 
+class AcceptedFindingsReasoner:
+    def __init__(self, answer: str, fact_ids: tuple[int, ...]) -> None:
+        self.answer = answer
+        self.fact_ids = fact_ids
+
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=True,
+            answer=self.answer,
+            accepted_fact_ids=self.fact_ids,
+            next_intents=[],
+        )
+
+
 class GraphAnswerReasoner:
     def plan(self, project: Project) -> ReasonResult:
         answers = [
@@ -469,13 +483,129 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         self.assertEqual(result.mode, DispatchMode.COMPLETED)
         self.assertEqual(client.project.facts[1].description, "result\nanswer: flag{graph}")
-        self.assertEqual(len(client.project.intents), 1)
+        self.assertEqual(len(client.project.intents), 2)
         producer = client.project.intents[seed_intent.id]
-        self.assertEqual(producer.to_fact_ids, (2, 1))
+        self.assertEqual(producer.to_fact_ids, (2,))
         self.assertEqual(producer.to_fact_id, 2)
+        self.assertNotIn(1, producer.to_fact_ids)
+        goal_edges = [
+            intent
+            for intent in client.project.intents.values()
+            if intent.description == "得到最终结果"
+        ]
+        self.assertEqual(len(goal_edges), 1)
+        self.assertEqual(goal_edges[0].from_fact_id, 2)
+        self.assertEqual(goal_edges[0].to_fact_ids, (1,))
+        self.assertTrue(goal_edges[0].is_completed)
         self.assertFalse(
             any(intent.description == "确认该事实包含最终答案" for intent in client.project.intents.values())
         )
+
+    def test_multi_finding_answer_sentence_does_not_complete(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            objective="寻找至少3个漏洞。",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("这是第 5 个已确认漏洞", fact_id=2)
+        producer = project.add_intent("check rate limit", from_fact_id=0, to_fact_id=2)
+        producer.mark_running()
+        producer.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("这是第 5 个已确认漏洞"),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        saved = client.project
+        self.assertNotEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertNotEqual(saved.status, ProjectStatus.COMPLETED)
+        self.assertEqual(saved.facts[1].description, "goal")
+        self.assertEqual(saved.intents[producer.id].to_fact_ids, (2,))
+        self.assertFalse(any(1 in intent.to_fact_ids for intent in saved.intents.values()))
+        self.assertTrue(any("完成被拒绝" in fact.description for fact in saved.facts.values()))
+        self.assertFalse(any(intent.action_key.startswith("verify-candidate-answer-") for intent in saved.intents.values()))
+
+    def test_multi_finding_completion_links_each_accepted_fact(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            objective="寻找至少3个漏洞。",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("reachability only", fact_id=2)
+        findings = {
+            3: "confirmed auth bypass",
+            4: "confirmed sandbox escape",
+            5: "confirmed account lockout",
+        }
+        producers = []
+        for fact_id, description in findings.items():
+            project.add_fact(description, fact_id=fact_id)
+            intent = project.add_intent(f"verify {fact_id}", from_fact_id=2, to_fact_id=fact_id)
+            intent.mark_running()
+            intent.mark_completed()
+            producers.append(intent)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=AcceptedFindingsReasoner("已确认3个漏洞", (3, 4, 5)),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        saved = client.project
+        self.assertEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(saved.status, ProjectStatus.COMPLETED)
+        self.assertIn("accepted_facts: F3、F4、F5", saved.facts[1].description)
+        self.assertIn("answer: 已确认3个漏洞", saved.facts[1].description)
+        for producer in producers:
+            self.assertNotIn(1, saved.intents[producer.id].to_fact_ids)
+        goal_edges = [
+            intent for intent in saved.intents.values() if intent.description == "得到最终结果"
+        ]
+        self.assertEqual(sorted(intent.from_fact_id for intent in goal_edges), [3, 4, 5])
+        self.assertTrue(all(intent.to_fact_ids == (1,) and intent.is_completed for intent in goal_edges))
+        self.assertFalse(any(intent.from_fact_id == 2 and 1 in intent.to_fact_ids for intent in saved.intents.values()))
+
+    def test_multi_finding_rejects_non_evidence_ids(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            objective="寻找至少3个漏洞。",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("confirmed auth bypass", fact_id=2)
+        project.add_fact("confirmed sandbox escape", fact_id=3)
+        project.add_fact("closed path", fact_id=4, kind=FactKind.REFUTED)
+        seed = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed.mark_running()
+        seed.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=AcceptedFindingsReasoner("已确认3个漏洞", (2, 3, 4)),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        saved = client.project
+        self.assertNotEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(saved.facts[1].description, "goal")
+        self.assertFalse(any(intent.description == "得到最终结果" for intent in saved.intents.values()))
+        self.assertTrue(any("F4 不是 evidence" in fact.description for fact in saved.facts.values()))
 
     def test_initial_probe_intent_is_not_reused_for_final_result(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)

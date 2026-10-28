@@ -600,6 +600,10 @@ button.project-delete:disabled {
   opacity: 1;
 }
 
+.graph-edge-completion {
+  stroke-dasharray: 7 5;
+}
+
 .graph-edge-flow {
   stroke: #1aa6b8;
   stroke-width: 3.2;

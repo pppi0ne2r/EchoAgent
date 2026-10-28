@@ -49,6 +49,7 @@ class ReasonResult:
     next_intent_descriptions: list[str] | None = None
     next_intents: list[dict[str, object]] | None = None
     answer: str | None = None
+    accepted_fact_ids: tuple[int, ...] = ()
     stop_reason: str = ""
     raw_output: str = ""
     salvaged: bool = False

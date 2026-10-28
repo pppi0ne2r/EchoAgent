@@ -5,6 +5,7 @@ from typing import Any
 
 from echo_agent.crypto_budget import MAX_MEMORY_MB, MAX_OUTPUT_BYTES, MAX_WALL_SECONDS, resolve_crypto_budget
 from echo_agent.crypto_contract import crypto_goal
+from echo_agent.dispatcher.objectives import required_finding_count
 from echo_agent.dispatcher.parsing import TEMPLATE_REASON_INTENTS
 from echo_agent.models import FactKind, Intent, IntentOutcome, IntentStatus, Project
 
@@ -181,13 +182,14 @@ class PromptBuilder:
     def build_reason_prompt(self, project: Project) -> str:
         if project.task_type == "crypto":
             return _build_crypto_reason_prompt(project)
+        required = required_finding_count(project.objective)
         return "\n".join(
             [
                 "你是一个 CTF/渗透测试题目的规划 agent，当前模式是 reason。",
                 "你的任务是根据 evidence 判断项目是否已经完成；如果未完成，只从 allowed_from 给出下一批 intent。",
                 "不要执行命令，不要进行扫描或利用，只做推理和规划。",
                 "最终答案的形式不固定，不要假设一定是 flag{...}。是否完成只对照 goal 中创建项目时填写的目的原文。",
-                "只有 evidence 中已经有逐字满足该目的的结论时，才返回 completed=true，answer 必须原样复制该结论。",
+                *_reason_completion_rules(required),
                 "猜测、扫描器告警和未实际验证的描述不能完成，应规划更小的验证步骤。",
                 "目的没有要求的结果不能当成完成。",
                 f"生成的 intent description 必须描述接下来需要探索的方向或验证动作，例如“{_EXAMPLE_DESCRIPTION}”，不要写成笼统的“继续推进”。",
@@ -202,21 +204,53 @@ class PromptBuilder:
                 "error、empty 的 note，以及“未完成执行的输出摘录”，都不是证伪结论，只能改写成更小的新步骤。",
                 "findings 里的证伪正文只用于判断，不能作为 from，也不能换一种说法重做。",
                 "允许同一个 evidence 产生多个 intent，但 action_key 不能重复。",
-                "只有答案已经作为满足目的的结论出现在 verified 执行记录中时，才返回 completed=true。",
+                "只有答案已经作为满足目的的结论出现在 verified 执行记录中时，才返回 completed=true。" if required <= 1 else "多漏洞完成只看 accepted_fact_ids。某一条 verified 记录里出现总结句，不能单独返回 completed=true。",
                 "agent reported possible final answer、未完成执行的输出摘录、error 和 refuted 都不能单独作为完成依据。",
                 "若 evidence 带 source: 行，那是去掉结果 JSON 后的原始输出片段，只能用来核验答案是否真实出现过。",
                 "如果没有新的可执行方向，返回 completed=false、next_intents=[]，并用 stop_reason 说明原因。不要为了凑数重复旧动作。",
-                "示例里的 action_key 和 description 只说明格式，不要原样输出。",
+                "示例里的 action_key、description 和 fact id 只说明格式，不要原样输出。",
                 "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
                 "JSON 格式：",
-                '{"completed": true, "answer": "实际可提交的最终答案", "stop_reason": "", "next_intents": []}',
+                _completed_example(required),
                 '{"completed": false, "answer": null, "stop_reason": "上传和备份面已经验证关闭", "next_intents": []}',
                 _REASON_INTENT_EXAMPLE,
                 "",
                 _format_project_context(project),
             ]
         )
+
+
+
+def _reason_completion_rules(required: int) -> list[str]:
+    if required <= 1:
+        return [
+            "只有 evidence 中已经有逐字满足该目的的结论时，才返回 completed=true，answer 必须原样复制该结论。",
+        ]
+    return [
+        f"当前目的要求至少 {required} 个已验证漏洞。completed=true 时必须提交 accepted_fact_ids，列出至少 {required} 个不同的 evidence fact id。",
+        "answer 只写简短总结，不能用来代替 accepted_fact_ids，也不需要逐字出现在某一条事实里。",
+        "一条事实里写“第N个漏洞”或“已确认N个漏洞”不算 N 个事实。系统只按 accepted_fact_ids 里的 evidence 计数。",
+        "accepted_fact_ids 只能选择 evidence。start、goal、refuted、error、未完成摘录和候选答案包装都不能列入。",
+        "verified 只表示某次动作的结论成立，不表示该事实自动属于最终结果。没有列入 accepted_fact_ids 的事实不会连到目标。",
+        "不要把可达性、目录枚举或过程记录凑进 accepted_fact_ids。只列入已经单独验证、并且本身就是漏洞结论的 evidence。",
+    ]
+
+
+def _completed_example(required: int) -> str:
+    if required <= 1:
+        return '{"completed": true, "answer": "实际可提交的最终答案", "stop_reason": "", "next_intents": []}'
+    example_ids = list(range(6, 6 + required))
+    return json.dumps(
+        {
+            "completed": True,
+            "answer": f"已确认{required}个漏洞",
+            "accepted_fact_ids": example_ids,
+            "stop_reason": "",
+            "next_intents": [],
+        },
+        ensure_ascii=False,
+    )
 
 
 def _build_crypto_first_run_prompt(project: Project, intent: Intent) -> str:
