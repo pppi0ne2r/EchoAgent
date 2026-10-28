@@ -488,7 +488,10 @@ button.project-delete:disabled {
 
 .graph-node { cursor: pointer; outline: none; }
 
-.graph-node text { pointer-events: none; }
+.graph-node text {
+  font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", Arial, sans-serif;
+  pointer-events: none;
+}
 
 .fact-node rect,
 .intent-node rect {

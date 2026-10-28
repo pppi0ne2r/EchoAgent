@@ -1844,7 +1844,16 @@ function node(x, y, title, description, selected = false, onClick = null, kind =
   });
   group.appendChild(rect);
   group.appendChild(svgText(x - 76, y - 15, title, { class: "node-title" }));
-  appendWrappedSvgText(group, x - 76, y + 8, description || "", 21, 2);
+  const clipId = `fact-text-${title}`;
+  const clip = svgElement("clipPath", { id: clipId });
+  clip.appendChild(svgElement("rect", {
+    x: x - 78,
+    y: y - 6,
+    width: 154,
+    height: 42,
+  }));
+  group.appendChild(clip);
+  appendWrappedSvgText(group, x - 76, y + 8, description || "", 148, 2, 12, `url(#${clipId})`);
   if (onClick) {
     group.addEventListener("click", onClick);
     group.addEventListener("keydown", (event) => {
@@ -1872,7 +1881,7 @@ function intentNode(x, y, title, description, status, selected = false, onClick 
     rx: 23,
   }));
   group.appendChild(svgText(x - 66, y - 3, title, { class: "node-title" }));
-  appendWrappedSvgText(group, x - 18, y - 3, description || status, 14, 1);
+  appendWrappedSvgText(group, x - 18, y - 3, description || status, 86, 1, 12);
   if (onClick) {
     group.addEventListener("click", onClick);
     group.addEventListener("keydown", (event) => {
@@ -1885,33 +1894,114 @@ function intentNode(x, y, title, description, status, selected = false, onClick 
   return group;
 }
 
-function appendWrappedSvgText(group, x, y, text, maxCharsPerLine, maxLines) {
-  const lines = wrapText(text, maxCharsPerLine, maxLines);
+const GRAPH_TEXT_FONT = '"Segoe UI", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", Arial, sans-serif';
+const GRAPH_TEXT_BREAKS = new Set([" ", "/", ".", "-", "_", "?", "&", "=", ":", ",", "，", "。", "、", "；", "："]);
+
+function appendWrappedSvgText(group, x, y, text, maxWidth, maxLines, fontSize = 12, clipPath = "") {
+  const lines = wrapText(text, maxWidth, maxLines, fontSize);
   for (const [index, lineText] of lines.entries()) {
-    group.appendChild(svgText(x, y + index * 16, lineText, { class: "node-description" }));
+    const attrs = {
+      class: "node-description",
+      "font-family": GRAPH_TEXT_FONT,
+      "font-size": fontSize,
+    };
+    if (clipPath) attrs["clip-path"] = clipPath;
+    group.appendChild(svgText(x, y + index * 16, lineText, attrs));
   }
 }
 
-function wrapText(value, maxCharsPerLine, maxLines) {
+function wrapText(value, maxWidth, maxLines, fontSize = 12) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (!text) return [""];
+  if (!text || maxLines < 1) return [""];
+  const chars = Array.from(text);
   const lines = [];
-  let remaining = text;
-  while (remaining && lines.length < maxLines) {
-    const limit = maxCharsPerLine;
-    let slice = remaining.slice(0, limit);
-    if (remaining.length > limit) {
-      const lastSpace = slice.lastIndexOf(" ");
-      if (lastSpace > 4) slice = slice.slice(0, lastSpace);
+  let index = 0;
+  while (index < chars.length && lines.length < maxLines) {
+    const remaining = chars.slice(index).join("");
+    if (measureTextWidth(remaining, fontSize) <= maxWidth) {
+      lines.push(remaining);
+      break;
     }
-    remaining = remaining.slice(slice.length).trimStart();
-    if (remaining && lines.length === maxLines - 1) {
-      slice = `${slice.slice(0, Math.max(0, limit - 1))}...`;
-      remaining = "";
+    const lastLine = lines.length === maxLines - 1;
+    const ellipsis = "...";
+    const budget = lastLine
+      ? Math.max(fontSize, maxWidth - measureTextWidth(ellipsis, fontSize))
+      : maxWidth;
+    let count = fittingCharCount(chars.slice(index), budget, fontSize);
+    if (!lastLine) count = preferTextBreak(chars, index, index + count) - index;
+    let line = chars.slice(index, index + count).join("").trimEnd();
+    if (!line) {
+      line = chars[index];
+      count = 1;
     }
-    lines.push(slice);
+    index += count;
+    while (chars[index] === " ") index += 1;
+    if (lastLine && index < chars.length) {
+      while (line && measureTextWidth(`${line}${ellipsis}`, fontSize) > maxWidth) {
+        line = Array.from(line).slice(0, -1).join("");
+      }
+      line = `${line}${ellipsis}`;
+      index = chars.length;
+    }
+    lines.push(line);
   }
-  return lines;
+  return lines.length ? lines : [""];
+}
+
+function fittingCharCount(chars, maxWidth, fontSize) {
+  let count = 0;
+  let accepted = "";
+  for (const char of chars) {
+    const next = `${accepted}${char}`;
+    if (count > 0 && measureTextWidth(next, fontSize) > maxWidth) break;
+    accepted = next;
+    count += 1;
+  }
+  return Math.max(count, chars.length ? 1 : 0);
+}
+
+function preferTextBreak(chars, start, end) {
+  const minIndex = start + Math.max(4, Math.floor((end - start) * 0.78));
+  for (let index = end - 1; index >= minIndex; index -= 1) {
+    const char = chars[index];
+    if (!GRAPH_TEXT_BREAKS.has(char)) continue;
+    return char === " " ? index : Math.min(end, index + 1);
+  }
+  return end;
+}
+
+function measureTextWidth(text, fontSize) {
+  const sample = String(text || "");
+  if (!sample) return 0;
+  if (typeof document !== "undefined" && document.createElement) {
+    const canvas = measureTextWidth.canvas || (measureTextWidth.canvas = document.createElement("canvas"));
+    const context = canvas.getContext && canvas.getContext("2d");
+    if (context) {
+      context.font = `${fontSize}px ${GRAPH_TEXT_FONT}`;
+      const width = context.measureText(sample).width;
+      if (Number.isFinite(width) && width > 0) return width;
+    }
+  }
+  let width = 0;
+  for (const char of sample) width += estimatedCharWidth(char, fontSize);
+  return width;
+}
+
+function estimatedCharWidth(char, fontSize) {
+  const code = char.codePointAt(0);
+  if (code <= 0x007f) return fontSize * 0.62;
+  if (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe6f) ||
+    (code >= 0xff01 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6)
+  ) {
+    return fontSize;
+  }
+  return fontSize * 0.72;
 }
 
 function svgElement(name, attrs) {
