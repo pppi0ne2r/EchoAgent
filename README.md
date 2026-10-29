@@ -1,149 +1,149 @@
 # EchoAgent
 
-EchoAgent is an experimental CTF / penetration-testing agent orchestrator. It keeps a task as a graph of facts and intents, uses Codex CLI workers inside per-project Docker containers, and provides a FastAPI web UI for observing the reasoning/exploration process.
+EchoAgent 是一个实验性的 CTF / 渗透测试智能体编排器。它把任务保存为事实（fact）和意图（intent）组成的图，在每个项目独立的 Docker 容器里运行 Codex CLI，并通过 FastAPI Web 界面观察推理和探索过程。
 
-## Acknowledgement
+## 致谢
 
-This project is inspired by and borrows ideas from [oritera/Cairn](https://github.com/oritera/Cairn), especially the idea of representing task progress as a graph-like reasoning process. EchoAgent is an independent implementation focused on Docker-isolated Codex workers, a local web UI, and configurable shared security resources.
+本项目受到 [oritera/Cairn](https://github.com/oritera/Cairn) 的启发，并借鉴了它用图表示任务推进过程的思路。EchoAgent 是独立实现，重点是 Docker 隔离的 Codex worker、本地 Web 界面，以及可配置的共享安全资源。
 
-## Features
+## 功能
 
-- Fact / intent graph for task state.
-- First-run, explore, and reason phases.
-- Parallel explore execution for multiple active intents.
-- Per-project Docker container isolation.
-- Shared resource mounting for nuclei templates, PoCs, tools, and knowledge bases.
-- Configurable Codex command, model, provider, retries, and timeout settings.
-- Web UI for project status, graph inspection, and runtime logs.
+- 用 fact / intent 图保存任务状态。
+- 包含首次执行、探索和推理三个阶段。
+- 多个活动 intent 可以并行探索。
+- 每个项目使用独立的 Docker 容器。
+- 可以挂载共享的 nuclei 模板、PoC、工具和知识库。
+- 可配置 Codex 命令、模型、供应商、重试和超时。
+- Web 界面可查看项目状态、事实图和运行日志。
 
-## Requirements
+## 环境要求
 
 - Python 3.11+
 - Docker
-- Codex CLI available in the worker image
-- Python dependencies from `requirements.txt`
+- worker 镜像中可用的 Codex CLI
+- `requirements.txt` 中的 Python 依赖
 
-Install dependencies:
+安装依赖：
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Or install the package in editable mode:
+或以可编辑模式安装：
 
 ```bash
 python -m pip install -e .
 ```
 
-## Configuration
+## 配置
 
-Copy the example config:
+复制示例配置：
 
 ```bash
 cp echo_agent.toml.example echo_agent.toml
 ```
 
-EchoAgent reads `echo_agent.toml` from the current working directory. You can use another file with:
+EchoAgent 从当前工作目录读取 `echo_agent.toml`。也可以指定其他文件：
 
 ```bash
 export ECHO_AGENT_CONFIG=/path/to/echo_agent.toml
 ```
 
-Configuration priority is:
+配置优先级为：
 
 ```text
-environment variables > .echo_agent/console_settings.toml > echo_agent.toml > echo_agent.toml.example
+环境变量 > .echo_agent/console_settings.toml > echo_agent.toml > echo_agent.toml.example
 ```
 
-Important sections:
+主要配置段：
 
-- `[server]`: web UI host, port, database path.
-- `[dispatcher]`: loop interval, per-project Codex slots, and how many projects may run together.
-- `[codex]`: Codex CLI command, models, provider, retries, timeouts.
-- `[docker]`: worker image build/run settings.
-- `[resources]`: host directory for the extension catalog. The tool list itself lives in the Extensions page.
+- `[server]`：Web 界面的主机、端口和数据库路径。
+- `[dispatcher]`：循环间隔、每个项目的 Codex 并发槽，以及可同时运行的项目数。
+- `[codex]`：Codex CLI 命令、模型、供应商、重试和超时。
+- `[docker]`：worker 镜像的构建和运行设置。
+- `[resources]`：扩展目录在宿主机上的根目录。工具清单本身在扩展页面维护。
 
-Use `echo_agent.toml` for local configuration and keep real secrets out of commits. `echo_agent.toml` is ignored by git; commit `echo_agent.toml.example` as the shared template.
+本地配置写入 `echo_agent.toml`，不要把真实密钥提交到仓库。`echo_agent.toml` 已被 git 忽略；需要共享的模板是 `echo_agent.toml.example`。
 
-## Shared Resources
+## 共享资源
 
-Tools, knowledge bases, and skills are configured on the web UI's Extensions page. EchoAgent stores that catalog in `extensions.json` and downloads the files into `[resources].root`.
+工具、知识库和技能在 Web 界面的扩展页面配置。EchoAgent 把这份清单保存在 `extensions.json`，并把文件下载到 `[resources].root`。
 
-Built-in entries are seeded on first start:
+首次启动时会写入内置条目：
 
-- Tools on `PATH`: katana, nuclei, dalfox, cloudfox, mounted at `/home/kali/.local/bin`.
-- `ysoserial` at `/home/kali/tools/ysoserial.jar`.
-- `nuclei-templates` at `/home/kali/.local/nuclei-templates`.
-- Shared directories: `/home/kali/tools`, `/home/kali/knowledges`, `/home/kali/pocs`, and skills at `/home/kali/.agents/skills`.
+- 加入 `PATH` 的工具：katana、nuclei、dalfox、cloudfox，挂载到 `/home/kali/.local/bin`。
+- `ysoserial` 位于 `/home/kali/tools/ysoserial.jar`。
+- `nuclei-templates` 位于 `/home/kali/.local/nuclei-templates`。
+- 共享目录：`/home/kali/tools`、`/home/kali/knowledges`、`/home/kali/pocs`，技能位于 `/home/kali/.agents/skills`。
 
-The server downloads missing files when it starts. A project run checks them again and stops if a download fails. Use Update on the Extensions page to download the current URL again and replace an existing file. Add or remove entries from the Extensions page; do not keep a second list in `echo_agent.toml`.
+服务启动时会下载缺失文件。项目运行前会再检查一次，下载失败则停止。扩展页面的“更新”会按当前 URL 重新下载并替换已有文件。增删条目只在扩展页面操作，不要在 `echo_agent.toml` 里再维护一份清单。
 
-`[resources].root` is only the host directory for those files. `items` stays empty.
+`[resources].root` 只是这些文件在宿主机上的目录。`items` 保持为空。
 
-## Start the Web Server
+## 启动 Web 服务
 
 ```bash
 python -m echo_agent server --host 127.0.0.1 --port 8000 --db .echo_agent/echo_agent.db
 ```
 
-Open:
+打开：
 
 ```text
 http://127.0.0.1:8000/
 ```
 
-You can also run FastAPI directly:
+也可以直接运行 FastAPI：
 
 ```bash
 uvicorn echo_agent.server.main:app --host 127.0.0.1 --port 8000
 ```
 
-## Dispatcher CLI
+## 调度命令
 
-Create and activate a project:
+创建并激活项目：
 
 ```bash
 python -m echo_agent dispatcher create-project \
   --target-url https://target.example \
-  --hint "optional hint" \
-  --objective "get flag" \
+  --hint "可选提示" \
+  --objective "获取 flag" \
   --activate
 ```
 
-Run one step:
+执行一步：
 
 ```bash
 python -m echo_agent dispatcher run-once 1 --max-workers 4
 ```
 
-Run a loop:
+循环执行：
 
 ```bash
 python -m echo_agent dispatcher run-loop 1 --interval 3 --max-steps 10 --max-workers 4
 ```
 
-## Docker Lifecycle
+## Docker 生命周期
 
-Each project uses one Docker container, usually named:
+每个项目使用一个 Docker 容器，名称通常是：
 
 ```text
 echo-agent-task-<project_id>
 ```
 
-Status behavior:
+状态行为：
 
-- `active`: create/start the project container and prepare mounts.
-- `running`: ensure the project container is running before Codex executes.
-- `stoped`: stop the project container.
-- `completed`: remove the project container.
+- `active`：创建或启动项目容器，并准备挂载。
+- `running`：Codex 执行前确保项目容器正在运行。
+- `stoped`：停止项目容器。
+- `completed`：删除项目容器。
 
-Clicking Stop in the web UI force-stops the project container with:
+在 Web 界面点击停止时，会强制停止项目容器：
 
 ```bash
 docker stop -t 0 <container>
 ```
 
-## Tests
+## 测试
 
 ```bash
 python -m unittest
