@@ -358,13 +358,16 @@ function updateActionButtons() {
     const ready = writeupState === "ready";
     const generating = writeupState === "running";
     const failed = writeupState === "error";
-    els.exportWriteup.disabled = !hasProject || state.busy || !ready;
-    els.exportWriteup.textContent = generating ? "生成中" : failed ? "生成失败" : "导出 WP";
-    els.exportWriteup.title = failed
-      ? (state.writeupStatus.error || "生成 WP 失败")
+    const canGenerate = !ready && !generating && !dispatcherActive;
+    els.exportWriteup.disabled = !hasProject || state.busy || generating || (!ready && !canGenerate);
+    els.exportWriteup.textContent = generating ? "生成中" : ready ? "导出 WP" : failed ? "重新生成" : "生成 WP";
+    els.exportWriteup.title = generating
+      ? "正在生成 WP"
       : ready
         ? "下载已生成的 WP"
-        : "项目完成后自动生成";
+        : failed
+          ? (state.writeupStatus.error || "生成失败，点击重新生成")
+          : "根据已有材料生成 WP";
   }
 }
 
@@ -2912,16 +2915,35 @@ async function pollWriteup() {
 }
 
 els.exportWriteup?.addEventListener("click", async () => {
-  if (!state.currentProjectId || state.writeupStatus?.status !== "ready") return;
+  if (!state.currentProjectId || state.busy) return;
+  const current = state.writeupStatus?.status;
+  if (current === "running") return;
   const projectId = state.currentProjectId;
-  const filename = state.writeupStatus?.filename;
+  if (current === "ready") {
+    const filename = state.writeupStatus?.filename;
+    try {
+      await withAction("下载 WP...", async () => {
+        await downloadWriteup(projectId, filename);
+      });
+      setStatus("done · WP 已下载");
+    } catch (error) {
+      setStatus(`error · ${error.message}`);
+    }
+    return;
+  }
+  state.busy = true;
+  updateActionButtons();
   try {
-    await withAction("下载 WP...", async () => {
-      await downloadWriteup(projectId, filename);
-    });
-    setStatus("done · WP 已下载");
+    state.writeupStatus = await api(`/projects/${projectId}/writeup`, { method: "POST" });
+    if (state.currentProjectId === projectId) {
+      ensureWriteupPoll();
+      setStatus("正在生成 WP");
+    }
   } catch (error) {
     setStatus(`error · ${error.message}`);
+  } finally {
+    state.busy = false;
+    updateActionButtons();
   }
 });
 
