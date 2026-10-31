@@ -351,6 +351,17 @@ class CodexDockerAgent:
                 shlex.quote(f"{shared}/.agents"),
                 shlex.quote(f"{workspace}/.agents"),
                 "; fi;",
+                "if [ -d /home/kali/.agents/skills ]; then",
+                "if [ -e",
+                shlex.quote(f"{codex_home}/skills"),
+                "] && [ ! -L",
+                shlex.quote(f"{codex_home}/skills"),
+                "]; then rm -rf",
+                shlex.quote(f"{codex_home}/skills"),
+                "; fi;",
+                "ln -sfn /home/kali/.agents/skills",
+                shlex.quote(f"{codex_home}/skills"),
+                "; fi;",
                 _ensure_codex_mcp_config(codex_home),
             ]
         )

@@ -292,6 +292,12 @@ time.sleep(5)
         self.assertIn("http://127.0.0.1:8000/mcp", script)
         self.assertIn("/home/kali/.codex/intents/4/config.toml", script)
         self.assertIn("flock -w 10", script)
+        self.assertIn("if [ -d /home/kali/.agents/skills ]; then", script)
+        self.assertIn(
+            "ln -sfn /home/kali/.agents/skills /home/kali/.codex/intents/4/skills",
+            script,
+        )
+        self.assertIn("rm -rf /home/kali/.codex/intents/4/skills", script)
 
     def test_intent_command_uses_isolated_codex_home_and_workspace(self) -> None:
         agent = CodexDockerAgent(workspace="/home/kali/workspace")
